@@ -21,6 +21,7 @@ import {
   AI_CONNECTION_CAPABILITIES,
   aiConnectionMetadataSchema,
   aiSubscriptionNeedsIsolatedLogin,
+  aiConnectionNeedsTokenValidation,
   isAiConnectionCompatible,
   supportsAiConnectionUsage,
   type AiConnectionBinding,
@@ -127,6 +128,9 @@ export function aiConnectionService(db: Db) {
       );
       if (!metadata.success) return [];
       const needsReconnect = aiSubscriptionNeedsIsolatedLogin(connection.config);
+      const tokenValidationPending = grant.status === "active" && connection.enabled
+        && connection.status === "active" && connection.healthStatus === "unchecked"
+        && aiConnectionNeedsTokenValidation(connection.config);
       if (!canUseCredential(grant, userId, members.filter((m) => m.grantId === grant.id)))
         return [];
       return [
@@ -135,7 +139,10 @@ export function aiConnectionService(db: Db) {
           grantId: grant.id,
           companyId,
           ...metadata.data,
-          usageProbeSupported: supportsAiConnectionUsage(metadata.data.provider, metadata.data.method),
+          usageProbeSupported: connection.config.aiOAuthTokenImport !== true
+            && supportsAiConnectionUsage(metadata.data.provider, metadata.data.method),
+          ...(tokenValidationPending ? { credentialValidationPending: true,
+            unavailableReason: "Token saved. Run an agent test to verify it." } : {}),
           name: connection.name,
           accountLabel: grant.providerTenant?.name,
           ...(needsReconnect ? { unavailableReason: "Reconnect with a separate sign-in to protect your existing terminal login." } : {}),
@@ -189,7 +196,8 @@ export function aiConnectionService(db: Db) {
         row.connection.connectionPurpose !== "ai" ||
         row.grant.status !== "active" ||
         !row.connection.enabled ||
-        row.connection.healthStatus !== "ok"
+        (row.connection.healthStatus !== "ok" && !(row.connection.healthStatus === "unchecked"
+          && aiConnectionNeedsTokenValidation(row.connection.config)))
       )
         throw unprocessable(
           "Reconnect this account before making it your default",
@@ -228,6 +236,11 @@ export function aiConnectionService(db: Db) {
     if (row.grant.status !== "active" || !row.connection.enabled || row.connection.status !== "active" ||
       row.connection.healthStatus !== "ok" || aiSubscriptionNeedsIsolatedLogin(row.connection.config)) {
       return { ...empty, status: "unavailable", errorCode: "connection_unavailable", message: "Reconnect or enable this AI connection before checking usage." };
+    }
+    if (metadata.data.provider === "anthropic" && metadata.data.method === "subscription"
+      && row.connection.config.aiOAuthTokenImport === true) {
+      return { ...empty, status: "unsupported", errorCode: "unsupported",
+        message: "Usage checks are unavailable for manually imported Claude OAuth tokens." };
     }
     if (!supportsAiConnectionUsage(metadata.data.provider, metadata.data.method)) {
       return { ...identity, ...await probeAiConnectionUsage(metadata.data, "") };
@@ -326,7 +339,8 @@ export function aiConnectionService(db: Db) {
       (connection.healthStatus !== "ok" &&
         !(
           input.allowLegacyValidation &&
-          connection.config.aiLegacyAdoption === true
+          (connection.config.aiLegacyAdoption === true || (connection.healthStatus === "unchecked"
+            && aiConnectionNeedsTokenValidation(connection.config)))
         ))
     )
       throw unprocessable("Reconnect or validate the selected AI account", {
@@ -460,10 +474,14 @@ export function aiConnectionService(db: Db) {
     companyId: string,
     userId: string,
     input: CreateAiConnection | AiConnectionLoginIntent,
-    verifiedCredential: string,
+    credentialValue: string,
     sessionId?: string,
     attemptStartedAt = new Date(),
+    options: { pendingClaudeOauthToken?: boolean } = {},
   ) {
+    const pendingToken = options.pendingClaudeOauthToken === true;
+    if (pendingToken && (input.provider !== "anthropic" || input.method !== "subscription"))
+      throw unprocessable("Pending token imports require a Claude subscription");
     if (!(await membership(companyId, userId)))
       throw forbidden("An active company member must own this connection");
     const reconnect = input.connectionId
@@ -573,7 +591,7 @@ export function aiConnectionService(db: Db) {
       if (secretId)
         await secrets.rotate(
           secretId,
-          { value: verifiedCredential },
+          { value: credentialValue },
           { userId },
         );
       else if (input.ownership === "personal") {
@@ -589,7 +607,7 @@ export function aiConnectionService(db: Db) {
         const secret = await secrets.createCurrentUserSecretValue(
           companyId,
           userId,
-          { definitionId: definition.id, value: verifiedCredential },
+          { definitionId: definition.id, value: credentialValue },
           { userId },
         );
         secretId = secret.id;
@@ -600,7 +618,7 @@ export function aiConnectionService(db: Db) {
             {
               name: `ai-${grantId}`,
               provider: "local_encrypted",
-              value: verifiedCredential,
+              value: credentialValue,
             },
             { userId },
           )
@@ -652,9 +670,10 @@ export function aiConnectionService(db: Db) {
           .set({
             enabled: true,
             status: "active",
-            healthStatus: "ok",
-            healthMessage: null,
-            config: { ...reconnect.connection.config, aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic" },
+            healthStatus: pendingToken ? "unchecked" : "ok",
+            healthMessage: pendingToken ? "Token saved. Run an agent test to verify it." : null,
+            config: { ...reconnect.connection.config, aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic",
+              aiOAuthTokenImport: pendingToken, aiCredentialValidationPending: pendingToken },
             updatedAt: new Date(),
           })
           .where(eq(toolConnections.id, id));
@@ -674,18 +693,20 @@ export function aiConnectionService(db: Db) {
               input.ownership === "personal" ? "per_user" : "shared",
             status: "active",
             enabled: true,
-            healthStatus: "ok",
+            healthStatus: pendingToken ? "unchecked" : "ok",
+            healthMessage: pendingToken ? "Token saved. Run an agent test to verify it." : null,
             config: {
               sourceTemplateKey: input.provider,
               ai: { provider: input.provider, method: input.method },
               aiIsolatedSubscription: input.method === "subscription" && input.provider !== "anthropic",
+              ...(pendingToken ? { aiOAuthTokenImport: true, aiCredentialValidationPending: true } : {}),
             },
             createdByUserId: userId,
           });
       let accountLabel: string | undefined;
       if (input.method === "subscription" && input.provider !== "anthropic") {
         try {
-          const credential = JSON.parse(verifiedCredential);
+          const credential = JSON.parse(credentialValue);
           const claims = credential.tokens?.id_token
             ? JSON.parse(
                 Buffer.from(
@@ -804,6 +825,46 @@ export function aiConnectionService(db: Db) {
       return { connectionId: id, grantId };
     });
   }
+  /** Only the exact imported generation that passed an explicit runtime test may become usable. */
+  async function markTokenValidated(input: {
+    companyId: string;
+    agentId?: string;
+    runStartedAt: Date;
+    attribution: AiConnectionAttribution & { identity: string };
+  }) {
+    return db.transaction(async (tx) => {
+      const { attribution } = input;
+      const [grant] = await tx.select().from(connectionGrants).where(and(
+        eq(connectionGrants.companyId, input.companyId), eq(connectionGrants.id, attribution.grantId),
+        eq(connectionGrants.connectionId, attribution.connectionId),
+      )).for("update");
+      if (!grant || grant.status !== "active" || grant.updatedAt > input.runStartedAt) return;
+      const [connection] = await tx.select().from(toolConnections).where(and(
+        eq(toolConnections.companyId, input.companyId), eq(toolConnections.id, attribution.connectionId),
+        eq(toolConnections.connectionPurpose, "ai"),
+      )).for("update");
+      if (!connection || !connection.enabled || connection.status !== "active"
+        || connection.healthStatus !== "unchecked" || connection.updatedAt > input.runStartedAt
+        || !aiConnectionNeedsTokenValidation(connection.config)
+        || attribution.provider !== "anthropic" || attribution.method !== "subscription") return;
+      const ref = grant.credentialSecretRefs.find(candidate => candidate.configPath === "ai.credential");
+      if (!ref) return;
+      await tx.select({ id: companySecrets.id }).from(companySecrets).where(and(
+        eq(companySecrets.companyId, input.companyId), eq(companySecrets.id, ref.secretId),
+      )).for("update");
+      const value = await aiConnectionService(tx as unknown as Db).credential({ connection, grant });
+      const generation = createHash("sha256").update(value).digest("hex").slice(0, 16);
+      if (attribution.identity !== `${grant.id}:${attribution.responsibleUserId ?? "shared"}:${generation}`) return;
+      await tx.update(toolConnections).set({ healthStatus: "ok", healthMessage: null,
+        config: { ...connection.config, aiCredentialValidationPending: false }, updatedAt: new Date(),
+      }).where(eq(toolConnections.id, connection.id));
+      await logActivity(tx as unknown as Db, { companyId: input.companyId, actorType: "system",
+        actorId: "adapter_test", agentId: input.agentId, action: "ai_connection.token_validated",
+        entityType: "tool_connection", entityId: connection.id,
+        details: { provider: attribution.provider, grantId: grant.id },
+      });
+    });
+  }
   /** A late failure must never invalidate credentials that were refreshed or reconnected meanwhile. */
   async function markAuthenticationFailed(input: {
     companyId: string;
@@ -848,5 +909,5 @@ export function aiConnectionService(db: Db) {
       });
     });
   }
-  return { list, select, credential, probeUsage, save, setDefault, membership, markAuthenticationFailed };
+  return { list, select, credential, probeUsage, save, setDefault, membership, markAuthenticationFailed, markTokenValidated };
 }

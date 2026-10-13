@@ -1,9 +1,10 @@
 import { describe, expect, it } from "vitest";
-import type { CompanySecret } from "@paperclipai/shared";
+import type { AiManagedConnectionSummary, CompanySecret } from "@paperclipai/shared";
 import type { MyUserSecretEntry } from "../api/secrets";
 import {
   savedProviderKeys,
   savedCodexSubscriptions,
+  savedManagedProviderAccounts,
 } from "./saved-provider-credentials";
 const secret = (overrides = {}) =>
   ({
@@ -28,6 +29,18 @@ const personal = (key = "ANTHROPIC_API_KEY.setup.abc", overrides = {}) =>
     secret: secret({ scope: "user" }),
   }) as MyUserSecretEntry;
 describe("saved provider keys", () => {
+  it("keeps an imported unverified default selectable for explicit testing without accepting revoked accounts", () => {
+    const account = { id: "connection", grantId: "grant", companyId: "c1", provider: "anthropic", method: "subscription",
+      name: "Imported Claude", ownership: "personal", ownerUserId: "user", isDefault: true,
+      status: "needs_attention", credentialValidationPending: true } as AiManagedConnectionSummary;
+    const choices = savedManagedProviderAccounts("c1", "anthropic", "user", [account]);
+    expect(choices).toEqual([expect.objectContaining({ credentialValidationPending: true,
+      label: "Imported Claude (Your default) · Test required",
+      aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" },
+    })]);
+    expect(savedManagedProviderAccounts("c1", "anthropic", "user", [{ ...account, status: "revoked" }])).toEqual([]);
+    expect(savedManagedProviderAccounts("c2", "anthropic", "user", [account])).toEqual([]);
+  });
   it("reuses canonical and setup keys with references, including normalized organization keys", () => {
     expect(
       savedProviderKeys(

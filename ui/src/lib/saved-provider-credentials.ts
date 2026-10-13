@@ -1,7 +1,7 @@
 import type { AiConnectionBinding, AiManagedConnectionSummary, AiProvider, CompanySecret, EnvBinding } from "@paperclipai/shared";
 import type { MyUserSecretEntry } from "../api/secrets";
 
-export type SavedProviderKey = { id: string; label: string } & (
+export type SavedProviderKey = { id: string; label: string; credentialValidationPending?: boolean } & (
   | { binding: EnvBinding; aiConnection?: never }
   | { binding?: never; aiConnection: AiConnectionBinding }
 );
@@ -11,12 +11,16 @@ export function savedManagedProviderAccounts(
   connections: AiManagedConnectionSummary[],
 ): SavedProviderKey[] {
   return connections.flatMap<SavedProviderKey>((account) => {
-    if (account.companyId !== companyId || account.provider !== provider || account.status !== "connected") return [];
+    const pending = account.credentialValidationPending === true && account.status === "needs_attention"
+      && account.provider === "anthropic" && account.method === "subscription";
+    if (account.companyId !== companyId || account.provider !== provider || (account.status !== "connected" && !pending)) return [];
+    const validation = pending ? { credentialValidationPending: true } : {};
+    const suffix = pending ? " · Test required" : "";
     if (account.ownership === "personal" && account.ownerUserId === currentUserId && account.isDefault) {
-      return [{ id: `ai:${account.grantId}`, label: `${account.name} (Your default)`, aiConnection: { provider, method: account.method, mode: "responsible_user" as const } }];
+      return [{ id: `ai:${account.grantId}`, label: `${account.name} (Your default)${suffix}`, ...validation, aiConnection: { provider, method: account.method, mode: "responsible_user" as const } }];
     }
     if (account.ownership === "shared") {
-      return [{ id: `ai:${account.grantId}`, label: `${account.name} (Company shared)`, aiConnection: { provider, method: account.method, mode: "shared" as const, connectionId: account.id, grantId: account.grantId } }];
+      return [{ id: `ai:${account.grantId}`, label: `${account.name} (Company shared)${suffix}`, ...validation, aiConnection: { provider, method: account.method, mode: "shared" as const, connectionId: account.id, grantId: account.grantId } }];
     }
     return [];
   });

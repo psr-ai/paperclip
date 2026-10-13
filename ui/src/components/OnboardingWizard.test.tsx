@@ -15,6 +15,8 @@ const mockAuthApi = vi.hoisted(() => ({ getSession: vi.fn() }));
 const localHealth = vi.hoisted(() => ({ get: vi.fn() }));
 vi.mock("@/api/health", () => ({ healthApi: localHealth }));
 const managedApi = vi.hoisted(() => ({
+  importClaudeOauthToken: vi.fn(async () => ({ connectionId: "imported-connection", grantId: "imported-grant", validationStatus: "pending" })),
+  setDefault: vi.fn(async () => ({})),
   list: vi.fn(async () => ({ currentUserId: "user-1", connections: [] })),
   startLocalLogin: vi.fn(async () => ({ sessionId: "local-attempt", command: "CODEX_HOME='/fixture/login' codex login", expiresAt: "2026-09-11T20:00:00Z" })),
   checkLocalLogin: vi.fn(async () => ({ status: "sign_in_required" as "sign_in_required" | "ready" })),
@@ -2058,6 +2060,53 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
       } finally {
         await act(async () => root.unmount());
       }
+    });
+
+    it.each(["modal", "kubernetes"])("offers OAuth import on unsupported %s and waits for explicit Test and connect", async (provider) => {
+      mockEnvironmentsApi.list.mockResolvedValue([{ ...SANDBOX_ENVIRONMENT, config: { provider } }]);
+      mockEnvironmentsApi.capabilities.mockResolvedValue(getEnvironmentCapabilities([], {
+        sandboxProviders: { [provider]: { supportsLoginPty: false } },
+      }));
+      mockAgentsApi.getAdapterAuthSignal.mockResolvedValue({ status: "absent" });
+      const { root } = await openStep4({ adapterType: "claude_local" });
+      try {
+        await pickSource(/Claude/);
+        const click = async (label: string) => {
+          const button = [...document.body.querySelectorAll("button")].find(item => item.textContent?.trim() === label && !item.closest("[inert]"));
+          expect(button).toBeTruthy(); await act(async () => button!.click()); await flushReact();
+        };
+        await click("Use existing OAuth token");
+        const input = document.body.querySelector('form[aria-label="Use existing Claude OAuth token"] input') as HTMLInputElement;
+        const token = "sk-ant-oat01-fixture_fixture_fixture_0123456789";
+        await act(async () => setControlledValue(input, token));
+        expect(managedApi.importClaudeOauthToken).not.toHaveBeenCalled();
+        expect(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)).not.toContain(token);
+        await click("Save OAuth token");
+        for (let i = 0; i < 8; i++) await flushReact();
+        expect(managedApi.setDefault).toHaveBeenCalledWith("company-new", "imported-grant");
+        expect(document.body.textContent).toContain("Test and connect");
+        expect(mockAgentsApi.startClaudeSetupTokenLogin).not.toHaveBeenCalled();
+        expect(mockAgentsApi.testEnvironment).not.toHaveBeenCalled();
+        expect(mockAgentsApi.hire).not.toHaveBeenCalled();
+        await click("Test and connect");
+        for (let i = 0; i < 8; i++) await flushReact();
+        expect(mockAgentsApi.testEnvironment).toHaveBeenCalled();
+        const testArgs = mockAgentsApi.testEnvironment.mock.calls.at(-1)!;
+        expect(testArgs).toContainEqual(expect.objectContaining({ aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } }));
+        expect(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)).not.toContain(token);
+      } finally { await act(async () => root.unmount()); }
+    });
+
+    it("opens the OAuth form before starting a supported browser login", async () => {
+      mockAgentsApi.getAdapterAuthSignal.mockResolvedValue({ status: "absent" });
+      const { root } = await openStep4({ adapterType: "claude_local" });
+      try {
+        const button = [...document.body.querySelectorAll("button")].find(item => item.textContent?.trim() === "Use existing OAuth token" && !item.closest("[inert]"));
+        await act(async () => button!.click()); await flushReact();
+        expect(document.body.querySelector('input[type="password"]')).not.toBeNull();
+        expect(mockAgentsApi.startClaudeSetupTokenLogin).not.toHaveBeenCalled();
+        expect(managedApi.importClaudeOauthToken).not.toHaveBeenCalled();
+      } finally { await act(async () => root.unmount()); }
     });
 
     it("names the tiles for the provider, not the adapter type", async () => {

@@ -148,7 +148,7 @@ export function AiConnectionField({
           changeBinding(aiConnectionBindingSchema.parse(binding))
         }
         onConnect={() => openConnection()}
-        onReconnect={(!value || value.mode === "responsible_user") && personalDefault && personalDefault.status !== "connected" ? () => openConnection(personalDefault) : undefined}
+        onReconnect={(!value || value.mode === "responsible_user") && personalDefault && personalDefault.status !== "connected" && !personalDefault.credentialValidationPending ? () => openConnection(personalDefault) : undefined}
         onRetry={() => void accounts.refetch()}
       />}
       <Dialog

@@ -117,9 +117,10 @@ vi.mock("../routes/ai-connections.js", async (importOriginal) => ({
   validateAiApiKey: mockValidateAiApiKey,
 }));
 const mockMarkAuthenticationFailed = vi.hoisted(() => vi.fn(async () => undefined));
+const mockMarkTokenValidated = vi.hoisted(() => vi.fn(async () => undefined));
 vi.mock("../services/ai-connections.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../services/ai-connections.js")>()),
-  aiConnectionService: () => ({ markAuthenticationFailed: mockMarkAuthenticationFailed }),
+  aiConnectionService: () => ({ markAuthenticationFailed: mockMarkAuthenticationFailed, markTokenValidated: mockMarkTokenValidated }),
 }));
 
 function mockManagedRuntime(method: "api_key" | "subscription") {
@@ -474,6 +475,24 @@ describe("agent test-environment route", () => {
       companyId: "company-1",
       attribution: expect.objectContaining({ connectionId: "conn-1", grantId: "grant-1" }),
     }));
+  });
+
+  it.each([
+    { status: "pass", code: "claude_hello_probe_passed", promoted: true },
+    { status: "warn", code: "claude_hello_probe_skipped", promoted: false },
+    { status: "fail", code: "claude_hello_probe_passed", promoted: false },
+  ] as const)("promotes an imported token only after a successful hello ($status / $code)", async ({ status, code, promoted }) => {
+    mockManagedRuntime("subscription");
+    testEnvironmentSpy.mockResolvedValueOnce({ adapterType: "external_test", status,
+      checks: [{ code, level: "info", message: "Fixture verdict" }], testedAt: new Date(0).toISOString() });
+    const app = await createApp();
+    const response = await request(app).post("/api/companies/company-1/adapters/external_test/test-environment")
+      .send({ adapterConfig: { cwd: "/" }, aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } });
+    expect(response.status).toBe(200);
+    expect(mockPrepareManagedAiRuntime).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ allowLegacyValidation: true }));
+    expect(mockMarkTokenValidated).toHaveBeenCalledTimes(promoted ? 1 : 0);
+    if (promoted) expect(mockMarkTokenValidated).toHaveBeenCalledWith(expect.objectContaining({ companyId: "company-1",
+      attribution: expect.objectContaining({ identity: "grant-1:local-board:0000000000000000" }) }));
   });
 
   it("still fails subscription adoption when no hello probe can run", async () => {

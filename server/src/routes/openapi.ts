@@ -7,6 +7,7 @@ import { Router } from "express";
 import { z } from "zod";
 import {
   createAiConnectionSchema,
+  importClaudeOauthTokenSchema,
   aiConnectionPoolConfigSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
@@ -1347,6 +1348,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   ...browserUseOperations.map(([method, path]) => `${method.toUpperCase()} ${path}`),
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
+  "POST /api/companies/{companyId}/ai-connections/claude-oauth-token",
   "POST /api/companies/{companyId}/ai-connections/local",
   "POST /api/companies/{companyId}/ai-connections/local/attempts",
   "POST /api/companies/{companyId}/ai-connections/local/check",
@@ -10451,6 +10453,24 @@ registerCurrentRoute({
   summary: "Validate and connect an AI API key, or reconnect its existing grant",
   body: createAiConnectionSchema,
   responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+const claudeOauthTokenImportBody = zodToOpenApiSchema(importClaudeOauthTokenSchema);
+const claudeOauthTokenImportProperties = claudeOauthTokenImportBody.properties as Record<string, JsonSchema>;
+claudeOauthTokenImportProperties.token = { ...claudeOauthTokenImportProperties.token, writeOnly: true };
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/claude-oauth-token",
+  tags: ["ai-connections"],
+  summary: "Save an existing Claude OAuth token pending an explicit runtime test",
+  description: "Requires an active company board member and the existing personal/shared connection permissions. Provider and method are fixed to anthropic/subscription. Imports are format-checked and encrypted without contacting the provider; saved does not mean authenticated. An explicit agent test in the selected environment must complete a provider hello before ordinary execution may use this credential. Only the owner may reconnect an existing connection; identity and access are preserved. Tokens are never returned, cannot use the usage probe, and are not automatically refreshed.",
+  request: { params: paramsSchemaFromPath("/api/companies/{companyId}/ai-connections/claude-oauth-token"),
+    body: { required: true, content: { "application/json": { schema: claudeOauthTokenImportBody } } } },
+  responses: {
+    201: { ...r.ok(z.object({ connectionId: z.string().uuid(), grantId: z.string().uuid(), validationStatus: z.literal("pending") })),
+      headers: { "Cache-Control": { schema: { type: "string", enum: ["no-store"] } } } },
+    400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable,
+  },
 });
 
 registerCurrentRoute({

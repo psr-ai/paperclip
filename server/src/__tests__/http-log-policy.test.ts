@@ -60,6 +60,12 @@ describe("isPrivateWebhookHttpRequest", () => {
 });
 
 describe("isSecretSensitiveHttpRequest", () => {
+  it("protects manual Claude OAuth token imports", () => {
+    expect(isSecretSensitiveHttpRequest("POST", "/api/companies/company-1/ai-connections/claude-oauth-token")).toBe(true);
+    expect(isSecretSensitiveHttpRequest("POST", "/api/companies/company-1/ai-connections/claude-oauth-token?retry=true")).toBe(true);
+    expect(isSecretSensitiveHttpRequest("POST", "/API/COMPANIES/company-1/AI-CONNECTIONS/CLAUDE-OAUTH-TOKEN")).toBe(true);
+    expect(isSecretSensitiveHttpRequest("GET", "/api/companies/company-1/ai-connections")).toBe(false);
+  });
   it("identifies credential-bearing chat setup mutations", () => {
     expect(
       isSecretSensitiveHttpRequest(

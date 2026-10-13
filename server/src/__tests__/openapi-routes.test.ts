@@ -237,6 +237,21 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents a write-only board Claude token import with pending validation", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/companies/{companyId}/ai-connections/claude-oauth-token"].post;
+    expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    expect(operation.requestBody.content["application/json"].schema).toMatchObject({
+      additionalProperties: false, required: expect.arrayContaining(["token", "name", "ownership"]),
+      properties: { token: { type: "string", writeOnly: true, maxLength: 32768 } },
+    });
+    const result = operation.responses["201"];
+    expect(Object.keys(result.content["application/json"].schema.properties).sort()).toEqual(["connectionId", "grantId", "validationStatus"]);
+    expect(result.content["application/json"].schema.properties.validationStatus.enum).toEqual(["pending"]);
+    expect(result.headers["Cache-Control"].schema.enum).toEqual(["no-store"]);
+  });
+
   it("documents board-only pool management with revision-checked deletion", () => {
     const { spec } = loadSpecRoutes();
     const pools = spec.paths["/api/companies/{companyId}/ai-connection-pools"];

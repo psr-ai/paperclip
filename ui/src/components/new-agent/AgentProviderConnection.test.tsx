@@ -14,6 +14,8 @@ const mocks = vi.hoisted(() => ({
   loginPanel: vi.fn(),
 }));
 const managedApi = vi.hoisted(() => ({
+  importClaudeOauthToken: vi.fn(async () => ({ connectionId: "imported-connection", grantId: "imported-grant", validationStatus: "pending" })),
+  setDefault: vi.fn(async () => ({})),
   list: vi.fn(async () => ({ currentUserId: "user-1", connections: [] })),
   loginResult: vi.fn(async () => ({ connectionId: "login-account", grantId: "login-grant" })),
   connectLocal: vi.fn(async () => ({ connectionId: "local-account", grantId: "local-grant" })),
@@ -149,6 +151,65 @@ function openProvider() {
   );
 }
 describe("AgentProviderConnection reuse", () => {
+  it.each([false, true])("imports a Claude token without starting browser login (PTY=%s), then explicitly tests the new binding", async (canLogin) => {
+    const { test, connected } = await mount("claude_local", true, canLogin, false, false);
+    click("Use existing OAuth token");
+    const input = host.querySelector('input[type="password"]')!;
+    flushSync(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "sk-ant-oat01-fixture_fixture_fixture_0123456789");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(managedApi.importClaudeOauthToken).not.toHaveBeenCalled();
+    flushSync(() => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    await vi.waitFor(() => expect(host.textContent).toContain("Test and connect"));
+    expect(managedApi.setDefault).toHaveBeenCalledWith("c1", "imported-grant");
+    expect(mocks.loginPanel).not.toHaveBeenCalled(); expect(test).not.toHaveBeenCalled();
+    click("Test and connect");
+    await vi.waitFor(() => expect(connected).toHaveBeenCalled());
+    expect(test).toHaveBeenCalledWith({ env: {}, aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } });
+    expect(test.mock.calls[0][0]).not.toHaveProperty("applyStoredClaudeLogin");
+  });
+  it("saves a managed Claude reconnect without a model test or default change", async () => {
+    const onComplete = vi.fn();
+    const { test } = await mount("claude_local", false, false, false, false, false, {
+      intent: { provider: "anthropic", method: "subscription", name: "Team Claude", ownership: "shared", connectionId: "original", agentIds: ["agent"], allAgents: false },
+      initialMethod: "subscription", fixedMethod: true, onComplete,
+    });
+    click("Use existing OAuth token");
+    flushSync(() => {
+      const input = host.querySelector("input")!;
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "sk-ant-oat01-fixture_fixture_fixture_0123456789");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    // Flush the controlled input before the explicit submission.
+    flushSync(() => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalled());
+    expect(managedApi.importClaudeOauthToken).toHaveBeenCalledWith("c1", expect.objectContaining({ connectionId: "original", ownership: "shared", agentIds: ["agent"], allAgents: false }));
+    expect(test).not.toHaveBeenCalled(); expect(managedApi.setDefault).not.toHaveBeenCalled();
+  });
+  it("ignores an old company's saved token while selecting its default is pending", async () => {
+    let finishDefault!: (value: object) => void;
+    managedApi.setDefault.mockImplementationOnce(() => new Promise((resolve) => { finishDefault = resolve; }));
+    const { test, connected } = await mount("claude_local", false, false, false, false);
+    click("Use existing OAuth token");
+    flushSync(() => {
+      const input = host.querySelector('input[type="password"]')!;
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, "sk-ant-oat01-fixture_fixture_fixture_0123456789");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    flushSync(() => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    await vi.waitFor(() => expect(managedApi.setDefault).toHaveBeenCalledWith("c1", "imported-grant"));
+    flushSync(() => root.render(<QueryClientProvider client={client}>
+      <AgentProviderConnection companyId="c2" adapterType="claude_local" environmentId="e2" canLogin={false}
+        onBack={() => {}} testConnection={test} onConnected={connected} />
+    </QueryClientProvider>));
+    finishDefault({});
+    await vi.waitFor(() => expect(client.isFetching()).toBe(0));
+    expect(host.textContent).not.toContain("Token saved.");
+    expect(host.textContent).not.toContain("Test and connect");
+    expect(connected).not.toHaveBeenCalled();
+    expect(test).not.toHaveBeenCalled();
+  });
   it.each([
     ["anthropic", "claude_local"], ["openai", "codex_local"], ["xai", "grok_local"],
   ] as const)("lets %s recovery switch methods without overwriting the original account", async (provider, adapterType) => {

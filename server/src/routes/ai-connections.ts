@@ -14,6 +14,7 @@ import {
 } from "@paperclipai/db";
 import {
   createAiConnectionSchema,
+  importClaudeOauthTokenSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -309,6 +310,23 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
             ),
           ),
       );
+    },
+  );
+  router.post(
+    "/companies/:companyId/ai-connections/claude-oauth-token",
+    (_req, res, next) => { res.setHeader("Cache-Control", "no-store"); next(); },
+    validate(importClaudeOauthTokenSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const { token, ...intent } = importClaudeOauthTokenSchema.parse(req.body);
+      const input = { ...intent, provider: "anthropic" as const, method: "subscription" as const };
+      const userId = await assertAiConnectionCreateAccess(db, req, companyId, input);
+      // Setup tokens may have inference-only scope. A usage/profile rejection
+      // cannot establish validity, and import must never spend model quota.
+      const result = await service.save(companyId, userId, input, token, undefined, new Date(), {
+        pendingClaudeOauthToken: true,
+      });
+      res.status(201).json({ ...result, validationStatus: "pending" });
     },
   );
   router.post(

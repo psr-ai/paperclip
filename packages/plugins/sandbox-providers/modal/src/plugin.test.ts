@@ -65,31 +65,21 @@ function createFakeSandbox(overrides: FakeSandboxOverrides = {}) {
     execCalls.push({ argv, params });
     return overrides.execImpl ? overrides.execImpl(argv, params) : defaultExec(argv, params);
   });
-  const openedFiles: Array<{ path: string; mode: string; written: Uint8Array | null }> = [];
+  const writtenFiles: Array<{ path: string; text: string }> = [];
   const sandbox = {
     sandboxId: overrides.id ?? "sb-123",
     exec,
     execCalls,
-    openedFiles,
+    writtenFiles,
     setTags: vi.fn().mockResolvedValue(undefined),
     terminate: vi.fn().mockResolvedValue(undefined),
     detach: vi.fn(),
     poll: vi.fn().mockResolvedValue(null),
-    open: vi.fn().mockImplementation(async (path: string, mode: string) => {
-      const entry: { path: string; mode: string; written: Uint8Array | null } = {
-        path,
-        mode,
-        written: null,
-      };
-      openedFiles.push(entry);
-      return {
-        write: vi.fn().mockImplementation(async (data: Uint8Array) => {
-          entry.written = data;
-        }),
-        flush: vi.fn().mockResolvedValue(undefined),
-        close: vi.fn().mockResolvedValue(undefined),
-      };
-    }),
+    filesystem: {
+      writeText: vi.fn().mockImplementation(async (text: string, path: string) => {
+        writtenFiles.push({ path, text });
+      }),
+    },
   };
   return sandbox;
 }
@@ -591,7 +581,11 @@ describe("Modal sandbox provider plugin", () => {
     });
   });
 
-  it("stages stdin in the sandbox filesystem when execution needs redirected input", async () => {
+  it.each([
+    "input payload",
+    "",
+    "multiline input\nUnicode: \u2603 \ud83e\udd16\n$(printf must-not-run) 'quoted' \\",
+  ])("stages stdin through the filesystem API without changing its content (%j)", async (stdin) => {
     const sandbox = createFakeSandbox();
     mockSandboxesFromId.mockResolvedValue(sandbox);
 
@@ -603,22 +597,70 @@ describe("Modal sandbox provider plugin", () => {
       lease: { providerLeaseId: "sb-exec", metadata: {} },
       command: "cat",
       args: [],
-      stdin: "input payload",
+      stdin,
       cwd: "/srv/work",
     });
 
-    expect(sandbox.openedFiles).toHaveLength(1);
-    expect(sandbox.openedFiles[0]?.path).toMatch(/^\/tmp\/paperclip-stdin-/);
-    expect(sandbox.openedFiles[0]?.mode).toBe("w");
-    expect(sandbox.openedFiles[0]?.written).not.toBeNull();
-    expect(new TextDecoder().decode(sandbox.openedFiles[0]!.written!)).toBe("input payload");
+    expect(sandbox.writtenFiles).toHaveLength(1);
+    const stagedPath = sandbox.writtenFiles[0]!.path;
+    expect(stagedPath).toMatch(/^\/tmp\/paperclip-stdin-/);
+    expect(sandbox.writtenFiles[0]!.text).toBe(stdin);
+    expect(sandbox.filesystem.writeText).toHaveBeenCalledExactlyOnceWith(stdin, stagedPath);
 
     // First exec is the user command; second is the rm cleanup.
     const userCall = sandbox.execCalls[0]!;
     expect(userCall.argv[2]).toMatch(/&& exec 'cat' < '\/tmp\/paperclip-stdin-/);
+    expect(userCall.argv[2]).toContain(`< '${stagedPath}'`);
+    if (stdin) expect(userCall.argv[2]).not.toContain(stdin);
     const cleanupCall = sandbox.execCalls[1]!;
-    expect(cleanupCall.argv[2]).toMatch(/^rm -f '\/tmp\/paperclip-stdin-/);
+    expect(cleanupCall.argv[2]).toBe(`rm -f '${stagedPath}'`);
     expect(result?.exitCode).toBe(0);
+  });
+
+  it("waits for the staged stdin write before starting the command", async () => {
+    const sandbox = createFakeSandbox();
+    mockSandboxesFromId.mockResolvedValue(sandbox);
+    let finishWrite!: () => void;
+    sandbox.filesystem.writeText.mockImplementationOnce(() => new Promise<void>((resolve) => {
+      finishWrite = resolve;
+    }));
+
+    const execution = plugin.definition.onEnvironmentExecute?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      config: baseConfig,
+      lease: { providerLeaseId: "sb-exec", metadata: {} },
+      command: "cat",
+      stdin: "delayed input",
+    });
+
+    await vi.waitFor(() => expect(sandbox.filesystem.writeText).toHaveBeenCalledOnce());
+    expect(sandbox.exec).not.toHaveBeenCalled();
+    finishWrite();
+    expect((await execution)?.exitCode).toBe(0);
+    expect(sandbox.execCalls).toHaveLength(2);
+  });
+
+  it("does not execute the command when staging stdin fails and still cleans up", async () => {
+    const sandbox = createFakeSandbox();
+    mockSandboxesFromId.mockResolvedValue(sandbox);
+    sandbox.filesystem.writeText.mockRejectedValueOnce(new Error("filesystem write failed"));
+
+    await expect(plugin.definition.onEnvironmentExecute?.({
+      driverKey: "modal",
+      companyId: "c-1",
+      environmentId: "e-1",
+      config: baseConfig,
+      lease: { providerLeaseId: "sb-exec", metadata: {} },
+      command: "cat",
+      stdin: "input payload",
+    })).rejects.toThrow("filesystem write failed");
+
+    const stagedPath = sandbox.filesystem.writeText.mock.calls[0]![1];
+    expect(sandbox.execCalls).toHaveLength(1);
+    expect(sandbox.execCalls[0]!.argv[2]).toBe(`rm -f '${stagedPath}'`);
+    expect(mockClientClose).toHaveBeenCalledOnce();
   });
 
   it("rejects invalid shell env keys before execution", async () => {

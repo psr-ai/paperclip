@@ -255,9 +255,7 @@ function buildLoginShellScript(input: {
 }
 
 async function ensureRemoteWorkspace(sandbox: Sandbox, remoteCwd: string): Promise<void> {
-  // Use a one-shot exec to mkdir -p; Modal does not expose a direct
-  // filesystem mkdir helper and creating a file via `open()` does not create
-  // intermediate directories.
+  // Create the workspace before starting commands that use it as their cwd.
   const proc = await sandbox.exec(["sh", "-lc", `mkdir -p ${shellQuote(remoteCwd)}`]);
   const exitCode = await proc.wait();
   if (exitCode !== 0) {
@@ -268,13 +266,7 @@ async function ensureRemoteWorkspace(sandbox: Sandbox, remoteCwd: string): Promi
 }
 
 async function stageStdin(sandbox: Sandbox, stdin: string, remotePath: string): Promise<void> {
-  const file = await sandbox.open(remotePath, "w");
-  try {
-    await file.write(new TextEncoder().encode(stdin));
-    await file.flush();
-  } finally {
-    await file.close().catch(() => undefined);
-  }
+  await sandbox.filesystem.writeText(stdin, remotePath);
 }
 
 async function deleteStdinPath(sandbox: Sandbox, remotePath: string): Promise<void> {

@@ -1,7 +1,7 @@
 import { healthApi } from "@/api/health";
 import { aiConnectionsApi } from "@/api/ai-connections";
 import { useLocalAiLogin } from "../ai-connections/useLocalAiLogin";
-import { ClaudeOauthTokenForm } from "../ai-connections/ClaudeOauthTokenForm";
+import { SubscriptionCredentialForm } from "../ai-connections/SubscriptionCredentialForm";
 import { Button } from "../ui/button";
 import type { AiConnectionBinding, AiConnectionLoginIntent } from "@paperclipai/shared";
 import { useEffect, useRef, useState } from "react";
@@ -81,7 +81,7 @@ export function AgentProviderConnection({
     setOpened(false);
     setAuthorizationUrl(null);
     setLoginPhase("preparing");
-    setUseClaudeToken(false);
+    setUseOauthImport(false);
   };
   const [methodChoice, setMethod] = useState<"subscription" | "api" | null>(managedAccount?.initialMethod === "api_key" ? "api" : managedAccount ? "subscription" : null);
   const [opened, setOpened] = useState(false);
@@ -89,8 +89,8 @@ export function AgentProviderConnection({
   const [loginPhase, setLoginPhase] = useState<"preparing" | "ready" | "waiting" | "connecting">("preparing");
   const phaseBeforeSubmit = useRef<"ready" | "waiting">("ready");
   const [apiKey, setApiKey] = useState("");
-  const [useClaudeToken, setUseClaudeToken] = useState(false);
-  const [importedClaudeToken, setImportedClaudeToken] = useState(false);
+  const [useOauthImport, setUseOauthImport] = useState(false);
+  const [importedSubscription, setImportedSubscription] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [storedConnection, setStoredConnection] =
@@ -113,7 +113,7 @@ export function AgentProviderConnection({
             option.id === (subscriptionId ?? savedKeys.subscriptions[0]?.id),
         )
       : undefined;
-  const claudeTokenNeedsTest = importedClaudeToken || savedSubscription?.credentialValidationPending === true;
+  const subscriptionNeedsTest = importedSubscription || savedSubscription?.credentialValidationPending === true;
   const [selectedKeyId, setSelectedKeyId] = useState<string | null>(null);
   const selectedKey = savedKeys.options.find(
     (option) => option.id === (selectedKeyId ?? savedKeys.options[0]?.id),
@@ -144,13 +144,13 @@ export function AgentProviderConnection({
   activeScope.current = scopeKey;
   useEffect(() => {
     epoch.current++;
-    setUseClaudeToken(false); setImportedClaudeToken(false); setStoredConnection(null); setApiKey("");
+    setUseOauthImport(false); setImportedSubscription(false); setStoredConnection(null); setApiKey("");
     savedManagedAccount.current = null;
   }, [scopeKey]);
   const localLogin = useLocalAiLogin(companyId, managedIntent ?? {
     provider: aiProvider, method: "subscription", name: `My ${provider} subscription`,
     ownership: "personal", agentIds: [], allAgents: true,
-  }, canUseLocalLogin && !useClaudeToken && !storedConnection?.aiConnection && method === "subscription" && !savedSubscription && !storedLogin.data,
+  }, canUseLocalLogin && !useOauthImport && !storedConnection?.aiConnection && method === "subscription" && !savedSubscription && !storedLogin.data,
   { allowHostClaude: health.data?.deploymentMode === "local_trusted" });
   const auth = useQuery({
     queryKey: queryKeys.agents.authSignal(
@@ -236,7 +236,7 @@ export function AgentProviderConnection({
     }
   }
   const needsLogin =
-    !useClaudeToken && !storedConnection?.aiConnection &&
+    !useOauthImport && !storedConnection?.aiConnection &&
     method === "subscription" &&
     canLogin &&
     environmentId &&
@@ -271,16 +271,16 @@ export function AgentProviderConnection({
               setMethod(next);
               setApiKey("");
               setStoredConnection(null);
-              setImportedClaudeToken(false);
+              setImportedSubscription(false);
               setError(null);
             }}
           />
         </div>
       )}
-      {!opened && method === "subscription" && adapterType === "claude_local" && <Button
+      {!opened && method === "subscription" && <Button
         variant="link" disabled={managedAccount?.disabled}
-        onClick={() => { setUseClaudeToken(true); setOpened(true); setError(null); }}>
-        Use existing OAuth token
+        onClick={() => { setUseOauthImport(true); setOpened(true); setError(null); }}>
+        {adapterType === "claude_local" ? "Use existing OAuth token" : "Use existing OAuth credentials"}
       </Button>}
       {!opened && savedKeys.options.length > 0 && (
         <p className="mt-2 text-sm text-muted-foreground">
@@ -308,9 +308,9 @@ export function AgentProviderConnection({
       >
         {opened && (
           <div className="pt-5">
-            {useClaudeToken ? (
-              <ClaudeOauthTokenForm key={scopeKey} companyId={companyId}
-                intent={managedIntent ?? { provider: "anthropic", method: "subscription", name: "My Claude subscription", ownership: "personal", agentIds: [], allAgents: true }}
+            {useOauthImport ? (
+              <SubscriptionCredentialForm key={scopeKey} companyId={companyId} provider={aiProvider}
+                intent={managedIntent ?? { provider: aiProvider, method: "subscription", name: `My ${provider} subscription`, ownership: "personal", agentIds: [], allAgents: true }}
                 disabled={managedAccount?.disabled}
                 onCancel={cancel}
                 onSaved={async (result) => {
@@ -321,11 +321,11 @@ export function AgentProviderConnection({
                   }
                   await aiConnectionsApi.setDefault(companyId, result.grantId);
                   if (attempt !== epoch.current || activeScope.current !== scopeKey) return;
-                  setStoredConnection({ env: {}, aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } });
-                  setImportedClaudeToken(true); setUseClaudeToken(false); setAuthorizationUrl(null);
+                  setStoredConnection({ env: {}, aiConnection: { provider: aiProvider, method: "subscription", mode: "responsible_user" } });
+                  setImportedSubscription(true); setUseOauthImport(false); setAuthorizationUrl(null);
                 }} />
-            ) : claudeTokenNeedsTest && method === "subscription" ? (
-              <p role="status" className="text-sm text-muted-foreground">Token saved. Test and connect to verify Claude access; the test may use your model quota.</p>
+            ) : subscriptionNeedsTest && method === "subscription" ? (
+              <p role="status" className="text-sm text-muted-foreground">{adapterType === "claude_local" ? "Token" : "Sign-in"} saved. Test and connect to verify {provider} access; the test may use your model quota.</p>
             ) : method === "api" ? (
               <OnboardingLoginCard
                 instruction={
@@ -415,9 +415,9 @@ export function AgentProviderConnection({
                     ? "Use the existing provider connection for this environment."
                     : adapterType === "claude_local"
                       ? "This environment does not support browser sign-in. Use an existing OAuth token or an API key."
-                      : "This environment does not support browser sign-in. Choose a sign-in environment or connect with an API key."}
+                      : "This environment does not support browser sign-in. Import an existing CLI sign-in or connect with an API key."}
               </p>
-              {adapterType === "claude_local" && !canLogin && !storedLogin.data && <Button variant="outline" disabled={managedAccount?.disabled} onClick={() => setUseClaudeToken(true)}>Use existing OAuth token</Button>}
+              {!canLogin && !storedLogin.data && <Button variant="outline" disabled={managedAccount?.disabled} onClick={() => setUseOauthImport(true)}>{adapterType === "claude_local" ? "Use existing OAuth token" : "Use existing OAuth credentials"}</Button>}
               </div>
             )}
           </div>
@@ -436,7 +436,7 @@ export function AgentProviderConnection({
       {localEnvironment && health.isError && (
         <p role="alert" className="mt-4 text-sm text-destructive">Could not prepare sign-in. Reload this page to try again.</p>
       )}
-      {!useClaudeToken && <FooterNav
+      {!useOauthImport && <FooterNav
         onBack={() => {
           if (opened) cancel();
           else onBack();
@@ -446,7 +446,7 @@ export function AgentProviderConnection({
             ? loginPhase === "waiting" ? "Waiting for code"
               : loginPhase === "connecting" ? "Connecting"
               : `Sign in to ${provider}`
-            : claudeTokenNeedsTest && method === "subscription"
+            : subscriptionNeedsTest && method === "subscription"
             ? "Test and connect"
             : busy
             ? "Connecting"

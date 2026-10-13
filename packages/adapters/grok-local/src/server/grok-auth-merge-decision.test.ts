@@ -99,6 +99,18 @@ describe("grok-auth-merge-decision predicate", () => {
     expect(await runDecision({ sourceAuth, destinationAuth })).toBe(KEEP_DESTINATION);
   });
 
+  it.each(["user_id", "principal_type", "principal_id", "team_id"])("does not merge another %s under the same OAuth client key", async (field) => {
+    const now = Date.now();
+    const auth = (fields: Record<string, unknown>, expiresAt: number) => JSON.stringify({
+      [IDENTITY_A]: { key: "token", refresh_token: "refresh", expires_at: new Date(expiresAt).toISOString(),
+        user_id: "user-1", principal_type: "User", principal_id: "principal-1", team_id: "team-1", ...fields },
+    });
+    const destinationAuth = auth({}, now + 60_000);
+    expect(await runDecision({ sourceAuth: auth({ [field]: "other" }, now + 120_000), destinationAuth })).toBe(KEEP_DESTINATION);
+    expect(await runDecision({ sourceAuth: auth({ [field]: null }, now + 120_000), destinationAuth })).toBe(KEEP_DESTINATION);
+    expect(await runDecision({ sourceAuth: auth({}, now + 120_000), destinationAuth })).toBe(USE_SOURCE);
+  });
+
   it("keeps the destination when the source expiry equals the destination expiry", async () => {
     const sameExpiry = new Date(Date.now() + 60_000).toISOString();
     const sourceAuth = usableAuthJson({ marker: "src", expiresAt: sameExpiry });

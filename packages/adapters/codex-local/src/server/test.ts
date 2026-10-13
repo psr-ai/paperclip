@@ -37,6 +37,7 @@ import {
 } from "./codex-auth-cache.js";
 import { resolveCodexExecutionEngineForRun, testCodexAcpEnvironment } from "./acp.js";
 import { ADAPTER_AUTH_MISSING_CHECK_CODE } from "./auth-check.js";
+import { copyBackCodexAuth } from "./codex-auth-copyback.js";
 
 function summarizeStatus(checks: AdapterEnvironmentCheck[]): AdapterEnvironmentTestResult["status"] {
   if (checks.some((check) => check.level === "error")) return "fail";
@@ -97,15 +98,25 @@ async function prepareCodexHelloProbe(input: {
   let probeHomeLocalDir: string | null = null;
 
   const cleanup = async () => {
-    await preparedRuntime?.restoreWorkspace().catch(() => {});
-    if (preparedRuntimeWorkspaceLocalDir) {
-      await fs.rm(preparedRuntimeWorkspaceLocalDir, { recursive: true, force: true }).catch(() => {});
+    let restoreFailed = false;
+    try {
+      await preparedRuntime?.restoreWorkspace();
+    } catch {
+      restoreFailed = true;
+    } finally {
+      await Promise.allSettled([
+        preparedRuntimeWorkspaceLocalDir ? fs.rm(preparedRuntimeWorkspaceLocalDir, { recursive: true, force: true }) : undefined,
+        probeHomeLocalDir ? fs.rm(probeHomeLocalDir, { recursive: true, force: true }) : undefined,
+      ]);
     }
-    if (probeHomeLocalDir) {
-      await fs.rm(probeHomeLocalDir, { recursive: true, force: true }).catch(() => {});
+    if (restoreFailed && input.managedAiConnection) {
+      // Never validate an imported credential after losing a refresh written
+      // by the provider. Keep transport errors and credential paths private.
+      throw new Error("Could not preserve the refreshed Codex sign-in. Retry the connection test.");
     }
   };
 
+  try {
   if (input.targetIsRemote && !input.probeApiKey) {
     // Prepare the exact home a real run would use, mirroring execute.ts: vend
     // the shared credential's freshest same-identity cached copy, then seed the
@@ -160,7 +171,7 @@ async function prepareCodexHelloProbe(input: {
       // `~/.codex`, so we copy the resolved bytes as a plain file.
       const contents = await fs.readFile(path.join(effectiveHome, file)).catch(() => null);
       if (contents) {
-        await fs.writeFile(path.join(probeHomeLocalDir, file), contents);
+        await fs.writeFile(path.join(probeHomeLocalDir, file), contents, { mode: 0o600 });
         if (file === "auth.json") seededAuth = true;
       }
     }
@@ -198,6 +209,18 @@ async function prepareCodexHelloProbe(input: {
           key: "home",
           localDir: probeHomeLocalDir,
           followSymlinks: true,
+          // Managed AI connections use an isolated controller-owned home. The
+          // outer runtime persists this refreshed native record under its
+          // grant/secret locks; never write it to the operator's auth cache.
+          ...(input.managedAiConnection ? {
+            restore: async ({ assetDir, readFile }: { assetDir: string; readFile: (file: string) => Promise<Buffer> }) => {
+              await copyBackCodexAuth({
+                readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
+                hostAuthPath: path.join(effectiveHome, "auth.json"),
+                log: () => {},
+              });
+            },
+          } : {}),
         },
       ],
     });
@@ -241,6 +264,12 @@ async function prepareCodexHelloProbe(input: {
     env: { ...input.env },
     cleanup,
   };
+  } catch (error) {
+    // Preparation can fail before the caller receives its cleanup callback.
+    // Do not leave the private credential staging directory behind on that path.
+    await cleanup();
+    throw error;
+  }
 }
 
 export async function testEnvironment(

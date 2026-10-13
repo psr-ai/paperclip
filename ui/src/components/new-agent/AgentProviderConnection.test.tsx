@@ -14,6 +14,7 @@ const mocks = vi.hoisted(() => ({
   loginPanel: vi.fn(),
 }));
 const managedApi = vi.hoisted(() => ({
+  importSubscriptionCredential: vi.fn(async () => ({ connectionId: "imported-connection", grantId: "imported-grant", validationStatus: "pending" })),
   importClaudeOauthToken: vi.fn(async () => ({ connectionId: "imported-connection", grantId: "imported-grant", validationStatus: "pending" })),
   setDefault: vi.fn(async () => ({})),
   list: vi.fn(async () => ({ currentUserId: "user-1", connections: [] })),
@@ -168,6 +169,43 @@ describe("AgentProviderConnection reuse", () => {
     await vi.waitFor(() => expect(connected).toHaveBeenCalled());
     expect(test).toHaveBeenCalledWith({ env: {}, aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } });
     expect(test.mock.calls[0][0]).not.toHaveProperty("applyStoredClaudeLogin");
+  });
+  it.each([["codex_local", "openai"], ["grok_local", "xai"]] as const)("imports %s in a hosted environment and requires explicit native verification", async (adapter, provider) => {
+    const { test, connected } = await mount(adapter, false, false, false, false);
+    click("Use existing OAuth credentials");
+    const credential = JSON.stringify({ tokens: { access_token: "fixture-access", refresh_token: "fixture-refresh" } });
+    const input = host.querySelector<HTMLInputElement>('input[type="password"]')!;
+    flushSync(() => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, credential);
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    flushSync(() => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    expect(input.value).toBe("");
+    await vi.waitFor(() => expect(host.textContent).toContain("Test and connect"));
+    expect(managedApi.importSubscriptionCredential).toHaveBeenCalledWith("c1", expect.objectContaining({ provider, credential, ownership: "personal" }));
+    expect(managedApi.setDefault).toHaveBeenCalledWith("c1", "imported-grant");
+    expect(test).not.toHaveBeenCalled(); expect(connected).not.toHaveBeenCalled(); expect(mocks.loginPanel).not.toHaveBeenCalled();
+    click("Test and connect");
+    await vi.waitFor(() => expect(connected).toHaveBeenCalled());
+    expect(test).toHaveBeenCalledWith({ env: {}, aiConnection: { provider, method: "subscription", mode: "responsible_user" } });
+    expect(JSON.stringify(test.mock.calls)).not.toContain("fixture-refresh");
+  });
+  it.each([["codex_local", "openai"], ["grok_local", "xai"]] as const)("keeps Apps %s reconnect scope and leaves imported credentials pending", async (adapter, provider) => {
+    const onComplete = vi.fn();
+    const { test } = await mount(adapter, false, false, false, false, false, {
+      intent: { provider, method: "subscription", name: "Team account", ownership: "shared", connectionId: "original", agentIds: ["agent"], allAgents: false },
+      initialMethod: "subscription", fixedMethod: true, onComplete,
+    });
+    click("Use existing OAuth credentials");
+    flushSync(() => {
+      const input = host.querySelector<HTMLInputElement>('input[type="password"]')!;
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(input, '{"refresh_token":"fixture-refresh"}');
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    flushSync(() => host.querySelector("form")!.dispatchEvent(new Event("submit", { bubbles: true, cancelable: true })));
+    await vi.waitFor(() => expect(onComplete).toHaveBeenCalledWith(expect.objectContaining({ connectionId: "imported-connection", grantId: "imported-grant", method: "subscription" })));
+    expect(managedApi.importSubscriptionCredential).toHaveBeenCalledWith("c1", expect.objectContaining({ provider, connectionId: "original", ownership: "shared", agentIds: ["agent"], allAgents: false }));
+    expect(test).not.toHaveBeenCalled(); expect(managedApi.setDefault).not.toHaveBeenCalled();
   });
   it("saves a managed Claude reconnect without a model test or default change", async () => {
     const onComplete = vi.fn();

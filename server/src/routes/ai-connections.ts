@@ -1,5 +1,6 @@
 import { supportsLocalAiLogin } from "../services/local-ai-login-policy.js";
 import { readVerifiedLocalAiCredential } from "../services/local-ai-credentials.js";
+import { normalizeSubscriptionCredential } from "../services/subscription-credential-import.js";
 import { localAiLoginService } from "../services/local-ai-login.js";
 import { z } from "zod";
 import { Router, type Request } from "express";
@@ -15,6 +16,7 @@ import {
 import {
   createAiConnectionSchema,
   importClaudeOauthTokenSchema,
+  importSubscriptionCredentialSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
   localAiLoginStartSchema,
@@ -325,6 +327,22 @@ export function aiConnectionRoutes(db: Db, options: Parameters<typeof supportsLo
       // cannot establish validity, and import must never spend model quota.
       const result = await service.save(companyId, userId, input, token, undefined, new Date(), {
         pendingClaudeOauthToken: true,
+      });
+      res.status(201).json({ ...result, validationStatus: "pending" });
+    },
+  );
+  router.post(
+    "/companies/:companyId/ai-connections/subscription-credential",
+    (_req, res, next) => { res.setHeader("Cache-Control", "no-store"); next(); },
+    validate(importSubscriptionCredentialSchema),
+    async (req, res) => {
+      const companyId = req.params.companyId as string;
+      const { credential, ...intent } = importSubscriptionCredentialSchema.parse(req.body);
+      const input = { ...intent, method: "subscription" as const };
+      const userId = await assertAiConnectionCreateAccess(db, req, companyId, input);
+      const normalized = normalizeSubscriptionCredential(input.provider, credential);
+      const result = await service.save(companyId, userId, input, normalized, undefined, new Date(), {
+        pendingSubscriptionCredential: true,
       });
       res.status(201).json({ ...result, validationStatus: "pending" });
     },

@@ -241,9 +241,20 @@ export interface ImportClaudeOauthTokenResult {
   validationStatus: "pending";
 }
 
+/** Write-only native CLI auth.json; an access token or API key is insufficient. */
+export const importSubscriptionCredentialSchema = aiConnectionLoginIntentSchema
+  .omit({ provider: true, method: true })
+  .extend({
+    provider: z.enum(["openai", "xai"]),
+    credential: z.string().trim().min(1).max(131072),
+  })
+  .strict();
+export type ImportSubscriptionCredential = z.infer<typeof importSubscriptionCredentialSchema>;
+export type ImportSubscriptionCredentialResult = ImportClaudeOauthTokenResult;
+
 export function aiConnectionNeedsTokenValidation(config: Record<string, unknown> | undefined): boolean {
   const metadata = aiConnectionMetadataSchema.safeParse(config?.ai);
-  return metadata.success && metadata.data.provider === "anthropic" && metadata.data.method === "subscription"
+  return metadata.success && ["anthropic", "openai", "xai"].includes(metadata.data.provider) && metadata.data.method === "subscription"
     && config?.aiOAuthTokenImport === true && config?.aiCredentialValidationPending === true;
 }
 

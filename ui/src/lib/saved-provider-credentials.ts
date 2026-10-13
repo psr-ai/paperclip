@@ -12,7 +12,7 @@ export function savedManagedProviderAccounts(
 ): SavedProviderKey[] {
   return connections.flatMap<SavedProviderKey>((account) => {
     const pending = account.credentialValidationPending === true && account.status === "needs_attention"
-      && account.provider === "anthropic" && account.method === "subscription";
+      && ["anthropic", "openai", "xai"].includes(account.provider) && account.method === "subscription";
     if (account.companyId !== companyId || account.provider !== provider || (account.status !== "connected" && !pending)) return [];
     const validation = pending ? { credentialValidationPending: true } : {};
     const suffix = pending ? " · Test required" : "";

@@ -8,10 +8,29 @@ import { describe, expect, it } from "vitest";
 import { HttpError } from "../errors.js";
 import { HTTP_LOG_REDACT_PATHS } from "../middleware/http-log-redaction.js";
 import { errorHandler } from "../middleware/error-handler.js";
-import { testAdapterEnvironmentSchema, importClaudeOauthTokenSchema } from "@paperclipai/shared";
+import { testAdapterEnvironmentSchema, importClaudeOauthTokenSchema, importSubscriptionCredentialSchema } from "@paperclipai/shared";
 import { createHttpLogger } from "../middleware/logger.js";
 
 describe("HTTP logger redaction", () => {
+  it.each(["malformed", "storage-error", "uppercase-storage-error"])("never logs or returns imported subscription credentials on %s", async failure => {
+    const sentinel = "private-subscription-credential-canary";
+    const chunks: string[] = [];
+    const stream = new Writable({ write(chunk, _encoding, callback) { chunks.push(chunk.toString()); callback(); } });
+    const app = express(); app.use(express.json());
+    app.use(createHttpLogger(pino({ redact: [...HTTP_LOG_REDACT_PATHS] }, stream)));
+    app.post("/api/companies/company-1/ai-connections/subscription-credential", (req, _res) => {
+      importSubscriptionCredentialSchema.parse(req.body);
+      throw new HttpError(503, `Storage failure echoed ${sentinel}`, { credential: sentinel });
+    });
+    app.use(errorHandler);
+    const response = await request(app).post(failure === "uppercase-storage-error"
+      ? "/API/COMPANIES/company-1/AI-CONNECTIONS/SUBSCRIPTION-CREDENTIAL"
+      : "/api/companies/company-1/ai-connections/subscription-credential")
+      .send({ provider: "openai", credential: failure === "malformed" ? { raw: sentinel } : sentinel, name: "Account", ownership: "personal" });
+    expect(response.status).toBe(failure === "malformed" ? 400 : 503);
+    expect(JSON.stringify(response.body)).not.toContain(sentinel);
+    expect(chunks.join("")).not.toContain(sentinel);
+  });
   it.each(["malformed", "storage-error", "uppercase-storage-error"])("never logs or returns a Claude import token on %s", async failure => {
     const sentinel = `sk-ant-oat01-${"private_import_canary".repeat(3)}`;
     const chunks: string[] = [];

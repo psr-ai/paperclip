@@ -427,6 +427,72 @@ describe("codex remote environment diagnostics", () => {
     expect(await fs.readFile(path.join(perAgentHome, "auth.json"), "utf8")).toBe(promoted);
   });
 
+  it.each([false, true])("preserves a managed probe's refreshed native auth record even when provider failure is %s", async (providerFails) => {
+    const home = await makeScratchDir("paperclip-managed-ai-codex-");
+    const original = subscriptionAuth("account-1", "original", "2026-07-09T01:00:00Z");
+    const refreshed = subscriptionAuth("account-1", "refreshed", "2026-07-09T02:00:00Z");
+    await fs.writeFile(path.join(home, "auth.json"), original, { mode: 0o600 });
+    const normalPrepare = prepareAdapterExecutionTargetRuntime.getMockImplementation()!;
+    let stagedHome = "";
+    prepareAdapterExecutionTargetRuntime.mockImplementationOnce(async (input) => {
+      const prepared = await normalPrepare(input);
+      const asset = input.assets![0] as { key: string; localDir: string;
+        restore: (context: { assetDir: string; readFile: (file: string) => Promise<Buffer> }) => Promise<void>;
+      };
+      stagedHome = asset.localDir;
+      expect((await fs.stat(path.join(stagedHome, "auth.json"))).mode & 0o777).toBe(0o600);
+      return { ...prepared, restoreWorkspace: vi.fn(async () => asset.restore({
+        assetDir: prepared.assetDirs.home,
+        readFile: async () => Buffer.from(refreshed),
+      })) };
+    });
+    if (providerFails) runAdapterExecutionTargetProcess.mockRejectedValueOnce(new Error("provider stopped"));
+    const probe = testEnvironment({
+      companyId: "company-1", adapterType: "codex_local", executionTarget: sandboxTarget(),
+      config: { engine: "cli", command: "codex", managedAiConnection: { provider: "openai" }, env: { CODEX_HOME: home } },
+    });
+    if (providerFails) await expect(probe).rejects.toThrow("provider stopped");
+    else expect((await probe).status).toBe("pass");
+    expect(await fs.readFile(path.join(home, "auth.json"), "utf8")).toBe(refreshed);
+    expect(await fs.stat(stagedHome).catch(() => null)).toBeNull();
+    expect(await fs.readdir(process.env.CODEX_HOME!)).toEqual([]);
+  });
+
+  it("fails a managed probe without exposing remote errors when refresh collection fails", async () => {
+    const home = await makeScratchDir("paperclip-managed-ai-codex-");
+    await fs.writeFile(path.join(home, "auth.json"), subscriptionAuth("account-1", "old", "2026-07-09T01:00:00Z"));
+    const normalPrepare = prepareAdapterExecutionTargetRuntime.getMockImplementation()!;
+    let stagedHome = "";
+    prepareAdapterExecutionTargetRuntime.mockImplementationOnce(async (input) => {
+      const prepared = await normalPrepare(input);
+      stagedHome = input.assets![0].localDir;
+      return { ...prepared, restoreWorkspace: vi.fn(async () => { throw new Error("PRIVATE-CREDENTIAL-MARKER"); }) };
+    });
+    await expect(testEnvironment({
+      companyId: "company-1", adapterType: "codex_local", executionTarget: sandboxTarget(),
+      config: { engine: "cli", managedAiConnection: { provider: "openai" }, env: { CODEX_HOME: home } },
+    })).rejects.toThrow("Could not preserve the refreshed Codex sign-in. Retry the connection test.");
+    expect(await fs.stat(stagedHome).catch(() => null)).toBeNull();
+  });
+
+  it("removes staged credentials when remote probe preparation fails", async () => {
+    const home = await makeScratchDir("paperclip-managed-ai-codex-");
+    const original = subscriptionAuth("account-1", "old", "2026-07-09T01:00:00Z");
+    await fs.writeFile(path.join(home, "auth.json"), original, { mode: 0o600 });
+    let stagedHome = "";
+    prepareAdapterExecutionTargetRuntime.mockImplementationOnce(async (input) => {
+      stagedHome = input.assets![0].localDir;
+      throw new Error("remote preparation unavailable");
+    });
+    await expect(testEnvironment({
+      companyId: "company-1", adapterType: "codex_local", executionTarget: sandboxTarget(),
+      config: { engine: "cli", managedAiConnection: { provider: "openai" }, env: { CODEX_HOME: home } },
+    })).rejects.toThrow("remote preparation unavailable");
+    expect(stagedHome).not.toBe("");
+    expect(await fs.stat(stagedHome).catch(() => null)).toBeNull();
+    expect(await fs.readFile(path.join(home, "auth.json"), "utf8")).toBe(original);
+  });
+
   it("stages an external CODEX_HOME's credentials as-is and never seeds or mutates it", async () => {
     const externalHome = await makeScratchDir("paperclip-test-external-codex-");
     const external = subscriptionAuth("acct-ext", "external", "2026-07-09T01:00:00Z");

@@ -237,6 +237,18 @@ function loadSpecRoutes() {
 }
 
 describe("openapi routes", () => {
+  it("documents the board-only native subscription import with a write-only credential", () => {
+    const { spec } = loadSpecRoutes();
+    const operation = spec.paths["/api/companies/{companyId}/ai-connections/subscription-credential"].post;
+    expect(operation.security).toEqual([{ BoardSessionAuth: [] }, { BoardApiKeyAuth: [] }]);
+    expect(operation["x-paperclip-authorization"]).toEqual({ actor: "board" });
+    expect(operation.requestBody.content["application/json"].schema).toMatchObject({
+      additionalProperties: false, required: expect.arrayContaining(["provider", "credential", "name", "ownership"]),
+      properties: { provider: { enum: ["openai", "xai"] }, credential: { type: "string", writeOnly: true, maxLength: 131072 } },
+    });
+    expect(Object.keys(operation.responses["201"].content["application/json"].schema.properties).sort()).toEqual(["connectionId", "grantId", "validationStatus"]);
+    expect(operation.responses["201"].headers["Cache-Control"].schema.enum).toEqual(["no-store"]);
+  });
   it("documents a write-only board Claude token import with pending validation", () => {
     const { spec } = loadSpecRoutes();
     const operation = spec.paths["/api/companies/{companyId}/ai-connections/claude-oauth-token"].post;

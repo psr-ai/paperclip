@@ -2,7 +2,7 @@ import { healthApi } from "@/api/health";
 import { LocalProviderLoginInstructions } from "./AdapterLoginChrome";
 import { useLocalAiLogin } from "./ai-connections/useLocalAiLogin";
 import { aiConnectionsApi } from "@/api/ai-connections";
-import { ClaudeOauthTokenForm } from "./ai-connections/ClaudeOauthTokenForm";
+import { SubscriptionCredentialForm } from "./ai-connections/SubscriptionCredentialForm";
 import { aiProviderForAdapter } from "./ai-connections/AiConnectionField";
 import type { AiConnectionBinding } from "@paperclipai/shared";
 import { storeProviderApiKey } from "../lib/provider-credential";
@@ -685,8 +685,8 @@ function OnboardingWizardInner({
    * `localStorage`, and a provider key does not belong there.
    */
   const [apiKey, setApiKey] = useState("");
-  const [useClaudeToken, setUseClaudeToken] = useState(false);
-  const [importedClaudeToken, setImportedClaudeToken] = useState(false);
+  const [useOauthImport, setUseOauthImport] = useState(false);
+  const [importedSubscription, setImportedSubscription] = useState(false);
   // The owner's stored Claude subscription login, read right before the hire
   // (see handleGiveHeartbeat). Onboarding applies it with no extra control,
   // so nothing else reads this state yet.
@@ -706,7 +706,7 @@ function OnboardingWizardInner({
   // otherwise only reuse an unambiguous account, regardless of list ordering.
   const savedSubscription = savedKeys.subscriptions.find((option) => option.aiConnection?.mode === "responsible_user")
     ?? (savedKeys.subscriptions.length === 1 ? savedKeys.subscriptions[0] : undefined);
-  const claudeTokenNeedsTest = importedClaudeToken || savedSubscription?.credentialValidationPending === true;
+  const subscriptionNeedsTest = importedSubscription || savedSubscription?.credentialValidationPending === true;
   const [selectedSavedKey, setSelectedSavedKey] = useState<{ companyId: string; envKey: string; id: string } | null>(null);
   const selectedApiKeyId = selectedSavedKey?.companyId === createdCompanyId && selectedSavedKey?.envKey === apiKeyEnvKeyFor(adapterType)
     ? selectedSavedKey.id
@@ -766,6 +766,7 @@ function OnboardingWizardInner({
   const apiKeySecretRef = useRef<{ key: string; companyId: string; envKey: string; binding?: Awaited<ReturnType<typeof storeProviderApiKey>>["binding"]; aiConnection?: AiConnectionBinding } | null>(null);
   const managedSubscriptionRef = useRef<{ companyId: string; binding: AiConnectionBinding } | null>(null);
   const managedProvider = aiProviderForAdapter(adapterType);
+  const oauthImportProvider = managedProvider === "anthropic" || managedProvider === "openai" || managedProvider === "xai" ? managedProvider : null;
   function managedBindingForStep(): AiConnectionBinding | undefined {
     if (credentialMode === "api") return selectedApiKey?.aiConnection ?? (
       !selectedApiKey && apiKeySecretRef.current?.companyId === createdCompanyId && apiKeySecretRef.current.envKey === apiKeyEnvKeyFor(adapterType)
@@ -1023,7 +1024,7 @@ function OnboardingWizardInner({
     provider: managedProvider ?? "anthropic", method: "subscription",
     name: `My ${CONNECT_SOURCE_NAMES[adapterType] ?? managedProvider} subscription`,
     ownership: "personal", agentIds: [], allAgents: true,
-  }, effectiveOnboardingOpen && step === 4 && canUseLocalLogin && !useClaudeToken && credentialMode !== "api" &&
+  }, effectiveOnboardingOpen && step === 4 && canUseLocalLogin && !useOauthImport && credentialMode !== "api" &&
     Boolean(managedProvider) && !savedSubscription && !savedKeys.storedLogin.data && !managedBindingForStep(),
   { allowHostClaude: localLoginHealth.data?.deploymentMode === "local_trusted" });
   // A result from a previous selection must not hire or advance this wizard.
@@ -1040,7 +1041,7 @@ function OnboardingWizardInner({
   }, [effectiveOnboardingOpen, createdCompanyId, adapterType, credentialMode, step]);
 
   const canShowAdapterLogin = Boolean(
-    !useClaudeToken &&
+    !useOauthImport &&
     adapterCaps.login != null &&
       resolvedLoginEnvironment?.driver === "sandbox" &&
       resolvedLoginEnvironmentId &&
@@ -1098,7 +1099,7 @@ function OnboardingWizardInner({
       Boolean(createdCompanyId) && effectiveOnboardingOpen && step === 4 && canShowAdapterLogin,
   });
   useEffect(() => {
-    if (useClaudeToken || claudeTokenNeedsTest || !activeLoginSessionQuery.data || credentialMode === "api" || savedSubscription || savedKeys.storedLogin.data) return;
+    if (useOauthImport || subscriptionNeedsTest || !activeLoginSessionQuery.data || credentialMode === "api" || savedSubscription || savedKeys.storedLogin.data) return;
     // Re-derive the row's answer along with the sequence: a resumed session
     // implies a source was already picked, and the row stays a question
     // otherwise (see `sourcePicked` above).
@@ -1109,7 +1110,7 @@ function OnboardingWizardInner({
     // prompt through `onPromptReady`, below, which is what moves this beat
     // from `loading` to `ready`, exactly as a fresh press would.
     setConnectPhase((phase) => (phase === "idle" ? "loading" : phase));
-  }, [activeLoginSessionQuery.data, credentialMode, savedSubscription, savedKeys.storedLogin.data, useClaudeToken, claudeTokenNeedsTest]);
+  }, [activeLoginSessionQuery.data, credentialMode, savedSubscription, savedKeys.storedLogin.data, useOauthImport, subscriptionNeedsTest]);
   /**
    * The signal is being fetched and has not answered yet.
    *
@@ -1130,6 +1131,7 @@ function OnboardingWizardInner({
     isLocalAdapterCaps ||
     adapterType === "claude_local" ||
     adapterType === "codex_local" ||
+    adapterType === "grok_local" ||
     adapterType === "gemini_local" ||
     adapterType === "kimi_local" ||
     adapterType === "opencode_local" ||
@@ -1148,8 +1150,10 @@ function OnboardingWizardInner({
       .map((a) => ({ ...getAdapterDisplay(a.type), type: a.type }));
 
     return {
-      recommendedAdapters: all.filter((a) => a.recommended),
-      moreAdapters: all.filter((a) => !a.recommended),
+      // Grok supports the same subscription/API-key setup as the recommended
+      // providers. Expose it here when enabled without changing other pickers.
+      recommendedAdapters: all.filter((a) => a.recommended || a.type === "grok_local"),
+      moreAdapters: all.filter((a) => !a.recommended && a.type !== "grok_local"),
     };
   }, [disabledTypes]);
 
@@ -1189,7 +1193,7 @@ function OnboardingWizardInner({
    * sandbox, or a local CLI account — Connect verifies credentials before the hire.
    */
   const connectStepNeedsLogin = Boolean(
-    !useClaudeToken && (!managedBindingForStep() || Boolean(connectAuthUrl)) &&
+    !useOauthImport && (!managedBindingForStep() || Boolean(connectAuthUrl)) &&
     credentialMode !== "api" &&
       // Connection-list invalidation can arrive before the login's completion
       // poll. Keep its controller mounted until it reports success; otherwise
@@ -1232,7 +1236,7 @@ function OnboardingWizardInner({
   const connectProgress = adapterEnvLoading ? "Testing connection…" : loading ? "Connecting…" : null;
   const hasSavedSubscription = Boolean(savedSubscription || savedKeys.storedLogin.data ||
     (credentialMode !== "api" && managedBindingForStep()));
-  const connectHasCard = useClaudeToken || claudeTokenNeedsTest || credentialMode === "api" || connectStepNeedsLogin || connectStepHasNoSandbox || Boolean(connectProgress);
+  const connectHasCard = useOauthImport || subscriptionNeedsTest || credentialMode === "api" || connectStepNeedsLogin || connectStepHasNoSandbox || Boolean(connectProgress);
   const connectCardLive =
     connectHasCard &&
     (connectPhase === "loading" ||
@@ -1284,7 +1288,7 @@ function OnboardingWizardInner({
   // chosen Claude or Codex. A saved-list refresh during that work is not a new
   // attempt, and a failed attempt waits for an explicit Connect retry.
   useEffect(() => {
-    if (useClaudeToken || claudeTokenNeedsTest || !effectiveOnboardingOpen || step !== 4 || connectPhase !== "ready" ||
+    if (useOauthImport || subscriptionNeedsTest || !effectiveOnboardingOpen || step !== 4 || connectPhase !== "ready" ||
         !connectStepReady || connectStepNeedsLogin || connectCredentialStored ||
         credentialMode !== "subscription" ||
         (adapterType !== "claude_local" && adapterType !== "codex_local") ||
@@ -1292,7 +1296,7 @@ function OnboardingWizardInner({
         loading || autoConnectStartedRef.current) return;
     autoConnectStartedRef.current = true;
     void handleGiveHeartbeat();
-  }, [effectiveOnboardingOpen, step, connectPhase, connectStepReady, connectStepNeedsLogin, useClaudeToken, claudeTokenNeedsTest,
+  }, [effectiveOnboardingOpen, step, connectPhase, connectStepReady, connectStepNeedsLogin, useOauthImport, subscriptionNeedsTest,
     connectCredentialStored, credentialMode, adapterType, hasSavedSubscription, localLogin.status, loading]);
 
   /**
@@ -1387,7 +1391,7 @@ function OnboardingWizardInner({
                 disabled: !connectAuthUrl,
               }
             : {
-                label: claudeTokenNeedsTest ? "Test and connect" : "Connect",
+                label: subscriptionNeedsTest ? "Test and connect" : "Connect",
                 icon: "arrow",
                 disabled:
                   !connectStepReady || (credentialMode === "api" && !apiKey.trim() && !selectedApiKey),
@@ -1411,8 +1415,8 @@ function OnboardingWizardInner({
    * the same thing that collects a session abandoned by closing the tab.
    */
   function unwindConnectStep() {
-    setUseClaudeToken(false);
-    setImportedClaudeToken(false);
+    setUseOauthImport(false);
+    setImportedSubscription(false);
     connectAttemptRef.current++;
     hiringAgentRef.current = null;
     setLoading(false);
@@ -1436,7 +1440,7 @@ function OnboardingWizardInner({
    * it is meant to start, against a source with no credential.
    */
   function handleConnectStepPrimary() {
-    if (useClaudeToken) return;
+    if (useOauthImport) return;
     // Mid-sequence the button belongs to the sign-in, not to the step.
     if (connectPhase === "ready" && connectStepNeedsLogin) {
       if (connectAuthUrl) window.open(connectAuthUrl, "_blank", "noreferrer,noopener");
@@ -2671,11 +2675,8 @@ function OnboardingWizardInner({
               {step === 4 && (
                 <motion.div key="step-4" {...stepContentMotion} exit={stepHandoff ? stepContentMotion.exit : undefined} className="space-y-8">
                   <div>
-                    {/* Sources come from `recommendedAdapters`, not a list
-                        written here — that filter is `recommended` in the
-                        display registry, so a third tile appears the day
-                        someone marks one rather than the day someone
-                        remembers to edit this file.
+                    {/* Sources come from enabled `recommendedAdapters`, which
+                        also includes Grok's supported model connection flow.
 
                         Picking one starts the sign-in now. The row is the
                         question, and answering it is what opens the card. */}
@@ -2697,8 +2698,8 @@ function OnboardingWizardInner({
                       settling={connectPhase === "unwindRow"}
                       onSelect={(id) => {
                         if (connectPhase !== "idle") return;
-                        setUseClaudeToken(false);
-                        setImportedClaudeToken(false);
+                        setUseOauthImport(false);
+                        setImportedSubscription(false);
                         autoConnectStartedRef.current = false;
                         setSourcePicked(true);
                         setAdapterType(id);
@@ -2732,14 +2733,14 @@ function OnboardingWizardInner({
                     >
                       <div className="-ml-3 mt-1">
                         <CredentialModeLink mode={credentialMode} onChange={(mode) => {
-                          setUseClaudeToken(false); setImportedClaudeToken(false); setCredentialMode(mode);
+                          setUseOauthImport(false); setImportedSubscription(false); setCredentialMode(mode);
                         }} />
-                        {credentialMode === "subscription" && recommendedAdapters.some((option) => option.type === "claude_local") && createdCompanyId && (
-                          <Button variant="link" onClick={() => {
-                            setAdapterType("claude_local"); setSourcePicked(true); setUseClaudeToken(true);
-                            setImportedClaudeToken(false); setConnectPhase("ready");
-                          }}>Use existing OAuth token</Button>
-                        )}
+                        {credentialMode === "subscription" && createdCompanyId && recommendedAdapters
+                          .filter((option) => ["claude_local", "codex_local", "grok_local"].includes(option.type))
+                          .map((option) => <Button key={option.type} variant="link" onClick={() => {
+                            setAdapterType(option.type); setSourcePicked(true); setUseOauthImport(true);
+                            setImportedSubscription(false); setConnectPhase("ready");
+                          }}>{option.type === "claude_local" ? "Use existing OAuth token" : `Use existing ${CONNECT_SOURCE_NAMES[option.type]} OAuth credentials`}</Button>)}
                         {savedKeys.options.length > 0 && <p className="px-3 text-sm text-muted-foreground">{savedKeys.options.length} saved API {savedKeys.options.length === 1 ? "key available" : "keys available"}.</p>}
                         {credentialMode === "subscription" && authSignalStatus === "present" && <p className="px-3 text-sm text-muted-foreground">An existing provider connection is available.</p>}
                       </div>
@@ -2782,16 +2783,16 @@ function OnboardingWizardInner({
                       not, and they outlive the space by a beat. See
                       `connectCardMounted`.
                     */}
-                    {!connectCardMounted ? null : useClaudeToken && createdCompanyId ? (
-                      <ClaudeOauthTokenForm key={`${createdCompanyId}:claude-token`} companyId={createdCompanyId}
-                        intent={{ provider: "anthropic", method: "subscription", name: "My Claude subscription", ownership: "personal", agentIds: [], allAgents: true }}
+                    {!connectCardMounted ? null : useOauthImport && createdCompanyId && oauthImportProvider ? (
+                      <SubscriptionCredentialForm key={`${createdCompanyId}:${oauthImportProvider}:subscription-import`} companyId={createdCompanyId} provider={oauthImportProvider}
+                        intent={{ provider: oauthImportProvider, method: "subscription", name: `My ${CONNECT_SOURCE_NAMES[adapterType] ?? oauthImportProvider} subscription`, ownership: "personal", agentIds: [], allAgents: true }}
                         onCancel={unwindConnectStep}
                         onSaved={async (result) => {
                           const attempt = connectAttemptRef.current;
                           await aiConnectionsApi.setDefault(createdCompanyId, result.grantId);
                           if (attempt !== connectAttemptRef.current) return;
-                          managedSubscriptionRef.current = { companyId: createdCompanyId, binding: { provider: "anthropic", method: "subscription", mode: "responsible_user" } };
-                          setImportedClaudeToken(true); setUseClaudeToken(false); setConnectAuthUrl(null); setConnectPhase("ready");
+                          managedSubscriptionRef.current = { companyId: createdCompanyId, binding: { provider: oauthImportProvider, method: "subscription", mode: "responsible_user" } };
+                          setImportedSubscription(true); setUseOauthImport(false); setConnectAuthUrl(null); setConnectPhase("ready");
                           void queryClient.invalidateQueries({ queryKey: ["ai-connections", createdCompanyId] });
                         }} />
                     ) : connectProgress ? (
@@ -2799,8 +2800,8 @@ function OnboardingWizardInner({
                         <Loader2 className="size-4 animate-spin" />
                         {connectProgress}
                       </p>
-                    ) : claudeTokenNeedsTest && credentialMode === "subscription" ? (
-                      <p role="status" className="text-sm text-muted-foreground">Token saved. Test and connect to verify Claude access; the test may use your model quota.</p>
+                    ) : subscriptionNeedsTest && credentialMode === "subscription" ? (
+                      <p role="status" className="text-sm text-muted-foreground">{adapterType === "claude_local" ? "Token" : "Sign-in"} saved. Test and connect to verify {CONNECT_SOURCE_NAMES[adapterType] ?? managedProvider} access; the test may use your model quota.</p>
                     ) : credentialMode === "api" ? (
                       <OnboardingLoginCard
                         instruction={savedKeys.options.length ? "Choose a saved API key or enter a new one" : `Provide your ${
@@ -2926,7 +2927,7 @@ function OnboardingWizardInner({
                         <LocalProviderLoginInstructions adapterType={adapterType} login={{ ...localLogin, retry: () => { autoConnectStartedRef.current = false; setError(null); localLogin.retry(); } }} />
                       ) : <div className="space-y-3">
                         <p className="text-xs text-muted-foreground">This environment does not support browser sign-in.</p>
-                        {adapterType === "claude_local" && createdCompanyId && <Button variant="outline" onClick={() => setUseClaudeToken(true)}>Use existing OAuth token</Button>}
+                        {oauthImportProvider && createdCompanyId && <Button variant="outline" onClick={() => setUseOauthImport(true)}>{adapterType === "claude_local" ? "Use existing OAuth token" : "Use existing OAuth credentials"}</Button>}
                         <Button variant="link" onClick={() => setCredentialMode("api")}>Use API key instead</Button>
                       </div>
                     ) : null}
@@ -3110,7 +3111,7 @@ function OnboardingWizardInner({
                   position from the first screen onward. It has no Back: step 1
                   is the first screen now that the front door is gone, and
                   `canGoBackFromOnboardingStep` returns false for it. */}
-              {(isAgentArcStep || step === 1) && !(step === 4 && useClaudeToken) && (
+              {(isAgentArcStep || step === 1) && !(step === 4 && useOauthImport) && (
                 <FooterNav
                   onBack={
                     // On the connect step Back unwinds the sign-in first, and

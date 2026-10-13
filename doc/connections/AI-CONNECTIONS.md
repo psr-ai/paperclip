@@ -138,6 +138,44 @@ setup tokens may carry inference-only scope, so a quota/profile rejection would
 not establish whether model authentication works. Saving a token alone never
 claims its account identity, entitlement, or validity.
 
+### Import a Codex or Grok subscription login
+
+OpenAI and Grok offer **Use existing OAuth credentials** in the existing Apps connection and
+reconnect page, agent setup, and onboarding. Import the complete native
+`auth.json` from a separate CLI sign-in dedicated to Paperclip. A bare OAuth
+access token cannot refresh itself, and an API-key file is not a subscription
+login. Reusing a rotating login concurrently in another CLI can invalidate one
+copy; this import does not read or alter the Paperclip server operator's login.
+
+`POST /api/companies/:companyId/ai-connections/subscription-credential` accepts
+`{ provider: "openai" | "xai", credential, name, ownership, connectionId?, agentIds?, allAgents? }`.
+The write-only credential is a native JSON string bounded to 128 KiB. Codex
+requires its access, refresh, and ID tokens, account ID, and `last_refresh`.
+Grok requires its current `oidc` login with `https://auth.x.ai` as issuer,
+matching client ID, user identity, native timestamps, and refresh credentials.
+Its format follows the official [Grok auth model](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-login/src/model.rs)
+and [issuer configuration](https://github.com/xai-org/grok-build/blob/main/crates/codegen/xai-grok-login/src/config.rs).
+Native Grok identity and account metadata are retained; arbitrary configuration
+and caller-selected issuer URLs are not imported. Legacy Grok browser-login
+files must be replaced through a current dedicated CLI sign-in.
+
+Both imports use the same encrypted personal/shared credential store and
+company, owner, and access checks as existing connections. Responses contain
+only connection/grant IDs and `validationStatus: "pending"`, are `no-store`,
+and never return credentials. Reconnect preserves the connection and existing
+access. Saving performs format validation without contacting a provider and
+does not trust a pasted token's account claims. Normal runs remain blocked until
+an explicit successful provider hello in the selected environment validates the
+exact stored generation. The test may use model quota.
+
+This route does not require a sandbox login PTY, so Kubernetes and Modal use the
+same managed connection. Runtime auth materialization creates a private native
+home, and the CLI refreshes its credentials there. Refreshed credentials are
+copied back before cleanup, then saved through the existing grant/secret locks
+and identity/freshness merge. Revocation or a newer reconnect cannot be undone
+by an older test. Existing Claude token import and native browser/device sign-in
+remain available and unchanged.
+
 ## On-demand usage limits
 
 The AI account detail has **Check usage**. It reads the selected account only

@@ -347,14 +347,14 @@ export async function prepareManagedAiRuntime(
                 const ref = grant.credentialSecretRefs.find(
                   (r) => r.configPath === "ai.credential",
                 );
-                if (!ref) return;
+                if (!ref || ref.secretId !== credentialRef.secretId) return;
                 // Lock the referenced secret row for the rest of this
                 // transaction. The grant-row lock above does not cover it,
                 // so an authorized rotation of this secret could otherwise
                 // land between the read and the write below and be
                 // overwritten by this stale write-back.
-                await tx
-                  .select({ id: companySecrets.id })
+                const [currentSecret] = await tx
+                  .select({ id: companySecrets.id, epoch: companySecrets.aiSessionEpoch })
                   .from(companySecrets)
                   .where(
                     and(
@@ -363,6 +363,10 @@ export async function prepareManagedAiRuntime(
                     ),
                   )
                   .for("update");
+                // An explicit reconnect starts another refresh-token lineage.
+                // Freshness alone cannot authorize an old run to overwrite it,
+                // even for the same account. Runtime refreshes preserve epoch.
+                if (!currentSecret || currentSecret.epoch !== freshness.epoch) return;
                 const current = await aiConnectionService(
                   tx as unknown as Db,
                 ).credential({ ...selection, grant });

@@ -15,6 +15,7 @@ const mockAuthApi = vi.hoisted(() => ({ getSession: vi.fn() }));
 const localHealth = vi.hoisted(() => ({ get: vi.fn() }));
 vi.mock("@/api/health", () => ({ healthApi: localHealth }));
 const managedApi = vi.hoisted(() => ({
+  importSubscriptionCredential: vi.fn(async () => ({ connectionId: "imported-connection", grantId: "imported-grant", validationStatus: "pending" })),
   importClaudeOauthToken: vi.fn(async () => ({ connectionId: "imported-connection", grantId: "imported-grant", validationStatus: "pending" })),
   setDefault: vi.fn(async () => ({})),
   list: vi.fn(async () => ({ currentUserId: "user-1", connections: [] })),
@@ -2094,6 +2095,44 @@ describe("OnboardingWizard restore-gate (stale localStorage across accounts)", (
         const testArgs = mockAgentsApi.testEnvironment.mock.calls.at(-1)!;
         expect(testArgs).toContainEqual(expect.objectContaining({ aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" } }));
         expect(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)).not.toContain(token);
+      } finally { await act(async () => root.unmount()); }
+    });
+
+    it.each([
+      ["codex_local", "openai", "OpenAI", "modal"],
+      ["codex_local", "openai", "OpenAI", "kubernetes"],
+      ["grok_local", "xai", "Grok", "modal"],
+      ["grok_local", "xai", "Grok", "kubernetes"],
+    ] as const)("imports %s sign-in for %s via %s on %s without browser login", async (adapterType, provider, label, sandbox) => {
+      mockAdapterRegistry.list = [{ type: "claude_local" }, { type: "codex_local" }, { type: "grok_local" }];
+      mockEnvironmentsApi.list.mockResolvedValue([{ ...SANDBOX_ENVIRONMENT, config: { provider: sandbox } }]);
+      mockEnvironmentsApi.capabilities.mockResolvedValue(getEnvironmentCapabilities([], { sandboxProviders: { [sandbox]: { supportsLoginPty: false } } }));
+      mockAgentsApi.getAdapterAuthSignal.mockResolvedValue({ status: "absent" });
+      const { root } = await openStep4({ adapterType: "claude_local" });
+      const click = async (text: string) => {
+        const button = [...document.body.querySelectorAll("button")].find(item => item.textContent?.trim() === text && !item.closest("[inert]"));
+        expect(button).toBeTruthy(); await act(async () => button!.click()); await flushReact();
+      };
+      try {
+        // Choose import directly while all provider cards are still shown.
+        await click(`Use existing ${label} OAuth credentials`);
+        const credential = JSON.stringify({ refresh_token: "fixture-private-refresh" });
+        const input = document.body.querySelector<HTMLInputElement>('input[type="password"]')!;
+        await act(async () => setControlledValue(input, credential));
+        expect(window.localStorage.getItem(ONBOARDING_STORAGE_KEY)).not.toContain("fixture-private-refresh");
+        await click("Save sign-in");
+        for (let i = 0; i < 8; i++) await flushReact();
+        expect(input.value).toBe("");
+        expect(managedApi.importSubscriptionCredential).toHaveBeenCalledWith("company-new", expect.objectContaining({ provider, credential, ownership: "personal" }));
+        expect(document.body.textContent).toContain("Test and connect");
+        expect(mockAgentsApi.startClaudeSetupTokenLogin).not.toHaveBeenCalled();
+        expect(mockAgentsApi.startAdapterAuthLogin).not.toHaveBeenCalled();
+        expect(mockAgentsApi.testEnvironment).not.toHaveBeenCalled(); expect(mockAgentsApi.hire).not.toHaveBeenCalled();
+        await click("Test and connect");
+        for (let i = 0; i < 8; i++) await flushReact();
+        expect(mockAgentsApi.testEnvironment).toHaveBeenCalled();
+        expect(mockAgentsApi.testEnvironment.mock.calls.at(-1)!).toContainEqual(expect.objectContaining({ aiConnection: { provider, method: "subscription", mode: "responsible_user" } }));
+        expect(JSON.stringify(mockAgentsApi.testEnvironment.mock.calls)).not.toContain("fixture-private-refresh");
       } finally { await act(async () => root.unmount()); }
     });
 

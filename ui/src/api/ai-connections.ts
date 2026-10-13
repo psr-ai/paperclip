@@ -1,6 +1,7 @@
-import type { AiConnectionList, AiConnectionUsage, CreateAiConnection, AiConnectionLoginIntent, ImportClaudeOauthToken, LocalAiLoginAttempt, LocalAiLoginStatus } from "@paperclipai/shared";
+import type { AiConnectionList, AiConnectionUsage, CreateAiConnection, AiConnectionLoginIntent, ImportClaudeOauthToken, ImportSubscriptionCredential, ImportSubscriptionCredentialResult, LocalAiLoginAttempt, LocalAiLoginStatus } from "@paperclipai/shared";
 import { api } from "./client";
 export const aiConnectionsApi = {
+  importSubscriptionCredential: (companyId: string, input: ImportSubscriptionCredential) => api.post<ImportSubscriptionCredentialResult>(`/companies/${companyId}/ai-connections/subscription-credential`, input),
   importClaudeOauthToken: (companyId: string, input: ImportClaudeOauthToken) => api.post<{ connectionId: string; grantId: string; validationStatus: "pending" }>(`/companies/${companyId}/ai-connections/claude-oauth-token`, input),
   probeUsage: (companyId: string, connectionId: string, grantId?: string) => api.get<AiConnectionUsage>(`/companies/${companyId}/ai-connections/${connectionId}/usage${grantId ? `?grantId=${encodeURIComponent(grantId)}` : ""}`),
   startLocalLogin: (companyId: string, input: AiConnectionLoginIntent & { restart?: boolean }) => api.post<LocalAiLoginAttempt>(`/companies/${companyId}/ai-connections/local/attempts`, input),

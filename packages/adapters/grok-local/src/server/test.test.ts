@@ -5,6 +5,7 @@ const ensureCommandMock = vi.hoisted(() => vi.fn(async () => {}));
 const runProcessMock = vi.hoisted(() => vi.fn());
 const prepareRuntimeMock = vi.hoisted(() => vi.fn());
 const stageGrokHomeMock = vi.hoisted(() => vi.fn(async () => "/tmp/staged-grok-home"));
+const copyBackGrokAuthMock = vi.hoisted(() => vi.fn(async (_input: unknown) => {}));
 
 vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
   describeAdapterExecutionTarget: () => "local",
@@ -17,7 +18,7 @@ vi.mock("@paperclipai/adapter-utils/execution-target", () => ({
 }));
 
 vi.mock("./grok-home.js", () => ({ stageGrokHomeForSync: stageGrokHomeMock }));
-vi.mock("./grok-auth-copyback.js", () => ({ copyBackGrokAuth: vi.fn(async () => {}) }));
+vi.mock("./grok-auth-copyback.js", () => ({ copyBackGrokAuth: copyBackGrokAuthMock }));
 
 import { existsSync } from "node:fs";
 import { parseGrokModelsOutput, testEnvironment } from "./test.js";
@@ -47,6 +48,7 @@ describe("grok_local testEnvironment", () => {
     runProcessMock.mockReset();
     prepareRuntimeMock.mockReset();
     stageGrokHomeMock.mockClear();
+    copyBackGrokAuthMock.mockReset();
   });
 
   it("reports a healthy authenticated host with a working hello probe", async () => {
@@ -308,6 +310,32 @@ describe("grok_local testEnvironment", () => {
     expect(unprepared).toMatchObject({ level: "error" });
     // A failed staging means there is no environment worth probing.
     expect(runProcessMock).not.toHaveBeenCalled();
+  });
+
+  it.each([false, true])("collects managed auth before cleanup and fails safely when collection failure is %s", async (copyFails) => {
+    const rotated = Buffer.from("native-auth-record");
+    let workspace = "";
+    prepareRuntimeMock.mockImplementationOnce(async (input) => {
+      workspace = input.workspaceLocalDir;
+      return { assetDirs: { home: "/sandbox/assets/home" }, restoreWorkspace: async () => {
+        await input.assets[0].restore({ assetDir: "/sandbox/assets/home", readFile: async () => rotated });
+      } };
+    });
+    copyBackGrokAuthMock.mockImplementationOnce(async (raw) => {
+      const input = raw as { hostHomeDir: string; readSandboxAuth: () => Promise<Buffer> };
+      expect(input.hostHomeDir).toBe("/tmp/controller-owned-grok");
+      expect(await input.readSandboxAuth()).toBe(rotated);
+      if (copyFails) throw new Error("PRIVATE-CREDENTIAL-MARKER");
+    });
+    // Rotation can precede a provider failure; collection must still run.
+    runProcessMock.mockRejectedValueOnce(new Error("provider stopped"));
+    await expect(testEnvironment({
+      companyId: "company-1", adapterType: "grok_local",
+      config: { command: "grok", cwd: "/sandbox/workspace", managedAiConnection: { provider: "xai" }, env: { GROK_HOME: "/tmp/controller-owned-grok" } },
+      executionTarget: { kind: "remote", transport: "sandbox" } as never,
+    })).rejects.toThrow(copyFails ? "Could not preserve the refreshed Grok sign-in. Retry the connection test." : "provider stopped");
+    expect(copyBackGrokAuthMock).toHaveBeenCalledOnce();
+    expect(existsSync(workspace)).toBe(false);
   });
 
   it("emits no adapter_auth_missing check for a local target with missing authentication", async () => {

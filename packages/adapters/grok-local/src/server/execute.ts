@@ -439,15 +439,19 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
                 // it is a strictly-later same-identity copy. The destination
                 // is always the server-derived managed Grok home, never a
                 // value read from `env.GROK_HOME`. A copy-out failure never
-                // fails the run: `copyBackGrokAuth` logs the errno code and
-                // rethrows, and this callback swallows that rejection.
+                // fails legacy runs. Managed connections must surface a lost
+                // refresh so a spent credential is not silently reused.
                 restore: async ({ assetDir, readFile }) =>
                   void (await copyBackGrokAuth({
                     readSandboxAuth: () => readFile(path.posix.join(assetDir, "auth.json")),
                     hostHomeDir: hostGrokHome,
                     log: (line) => onLog("stdout", `${line}\n`),
                     env: process.env,
-                  }).catch(() => undefined)),
+                  }).catch(() => {
+                    if (config.managedAiConnection) {
+                      throw new Error("Could not preserve the refreshed Grok sign-in.");
+                    }
+                  })),
               },
             ]
           : undefined,

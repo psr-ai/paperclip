@@ -392,7 +392,9 @@ export async function testEnvironment(
     testedAt: new Date().toISOString(),
   };
   } finally {
-    try { await restore?.(); } finally {
+    try { await restore?.(); } catch {
+      throw new Error("Could not preserve the refreshed Grok sign-in. Retry the connection test.");
+    } finally {
       // Both temporary directories are removed even when one removal fails,
       // and neither failure turns an answered environment test into a thrown
       // error: these are best-effort temp directories, and the caller asked

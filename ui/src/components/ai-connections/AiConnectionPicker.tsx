@@ -115,7 +115,7 @@ export function AiConnectionPicker({
               </> },
               ...compatible.filter((connection) => connection.ownership === "shared").map((connection) => ({
                 id: connection.id, name: connection.name,
-                disabled: Boolean(aiConnectionProblem(connection)) && !(connection.credentialValidationPending === true && connection.status === "needs_attention" && connection.provider === "anthropic" && connection.method === "subscription"),
+                disabled: Boolean(aiConnectionProblem(connection)) && !(connection.credentialValidationPending === true && connection.status === "needs_attention" && ["anthropic", "openai", "xai"].includes(connection.provider) && connection.method === "subscription"),
                 description: <>Company shared · {aiMethodLabel(connection.provider, connection.method)}{connection.accountLabel ? ` · ${connection.accountLabel}` : ""}{aiConnectionProblem(connection) ? ` · ${aiConnectionProblem(connection)}` : ""}</>,
               })),
             ]}

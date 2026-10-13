@@ -139,7 +139,7 @@ export function aiConnectionService(db: Db) {
           grantId: grant.id,
           companyId,
           ...metadata.data,
-          usageProbeSupported: connection.config.aiOAuthTokenImport !== true
+          usageProbeSupported: !(metadata.data.provider === "anthropic" && connection.config.aiOAuthTokenImport === true)
             && supportsAiConnectionUsage(metadata.data.provider, metadata.data.method),
           ...(tokenValidationPending ? { credentialValidationPending: true,
             unavailableReason: "Token saved. Run an agent test to verify it." } : {}),
@@ -477,11 +477,13 @@ export function aiConnectionService(db: Db) {
     credentialValue: string,
     sessionId?: string,
     attemptStartedAt = new Date(),
-    options: { pendingClaudeOauthToken?: boolean } = {},
+    options: { pendingClaudeOauthToken?: boolean; pendingSubscriptionCredential?: boolean } = {},
   ) {
-    const pendingToken = options.pendingClaudeOauthToken === true;
-    if (pendingToken && (input.provider !== "anthropic" || input.method !== "subscription"))
-      throw unprocessable("Pending token imports require a Claude subscription");
+    const pendingToken = options.pendingClaudeOauthToken === true || options.pendingSubscriptionCredential === true;
+    if (options.pendingClaudeOauthToken && input.provider !== "anthropic")
+      throw unprocessable("Pending Claude imports require a Claude subscription");
+    if (pendingToken && (input.method !== "subscription" || !["anthropic", "openai", "xai"].includes(input.provider)))
+      throw unprocessable("Pending imports require a supported subscription");
     if (!(await membership(companyId, userId)))
       throw forbidden("An active company member must own this connection");
     const reconnect = input.connectionId
@@ -704,7 +706,7 @@ export function aiConnectionService(db: Db) {
             createdByUserId: userId,
           });
       let accountLabel: string | undefined;
-      if (input.method === "subscription" && input.provider !== "anthropic") {
+      if (!pendingToken && input.method === "subscription" && input.provider !== "anthropic") {
         try {
           const credential = JSON.parse(credentialValue);
           const claims = credential.tokens?.id_token
@@ -846,7 +848,8 @@ export function aiConnectionService(db: Db) {
       if (!connection || !connection.enabled || connection.status !== "active"
         || connection.healthStatus !== "unchecked" || connection.updatedAt > input.runStartedAt
         || !aiConnectionNeedsTokenValidation(connection.config)
-        || attribution.provider !== "anthropic" || attribution.method !== "subscription") return;
+        || !["anthropic", "openai", "xai"].includes(attribution.provider) || attribution.method !== "subscription"
+        || (connection.config.ai as AiConnectionMetadata).provider !== attribution.provider) return;
       const ref = grant.credentialSecretRefs.find(candidate => candidate.configPath === "ai.credential");
       if (!ref) return;
       await tx.select({ id: companySecrets.id }).from(companySecrets).where(and(

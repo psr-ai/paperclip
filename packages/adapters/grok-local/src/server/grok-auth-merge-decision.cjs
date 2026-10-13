@@ -31,7 +31,15 @@ function parseAuthValue(raw) {
     typeof refreshToken === "string" &&
     refreshToken.trim().length > 0;
   if (!hasUsableValue) return { kind: "unusable" };
-  return { kind: "usable", identityKey, expiresAtRaw: value.expires_at };
+  // The composite key is issuer::OAuth client_id, shared by different users.
+  // Bind refreshed records to the actual account/principal as well. Legacy
+  // records missing these fields still compare with each other, but cannot
+  // replace a native record whose account identity is known.
+  const accountFields = ["user_id", "principal_type", "principal_id", "team_id"];
+  if (accountFields.some((field) => value[field] != null &&
+    (typeof value[field] !== "string" || !value[field].trim()))) return { kind: "unusable" };
+  const accountIdentity = JSON.stringify(accountFields.map((field) => value[field] ?? null));
+  return { kind: "usable", identityKey, accountIdentity, expiresAtRaw: value.expires_at };
 }
 
 function parseAuthFile(filePath) {
@@ -114,7 +122,8 @@ function decide(source, destination, nowMs) {
   if (
     source.kind === "unusable" ||
     destination.kind === "unusable" ||
-    source.identityKey !== destination.identityKey
+    source.identityKey !== destination.identityKey ||
+    source.accountIdentity !== destination.accountIdentity
   ) {
     return KEEP_DESTINATION;
   }

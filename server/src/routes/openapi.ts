@@ -8,6 +8,7 @@ import { z } from "zod";
 import {
   createAiConnectionSchema,
   importClaudeOauthTokenSchema,
+  importSubscriptionCredentialSchema,
   aiConnectionPoolConfigSchema,
   aiConnectionLoginIntentSchema,
   localAiConnectionSchema,
@@ -1349,6 +1350,7 @@ const BOARD_ONLY_OPERATIONS = new Set([
   "GET /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections",
   "POST /api/companies/{companyId}/ai-connections/claude-oauth-token",
+  "POST /api/companies/{companyId}/ai-connections/subscription-credential",
   "POST /api/companies/{companyId}/ai-connections/local",
   "POST /api/companies/{companyId}/ai-connections/local/attempts",
   "POST /api/companies/{companyId}/ai-connections/local/check",
@@ -10453,6 +10455,24 @@ registerCurrentRoute({
   summary: "Validate and connect an AI API key, or reconnect its existing grant",
   body: createAiConnectionSchema,
   responses: { 201: r.ok(), 400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable },
+});
+
+const subscriptionCredentialImportBody = zodToOpenApiSchema(importSubscriptionCredentialSchema);
+const subscriptionCredentialImportProperties = subscriptionCredentialImportBody.properties as Record<string, JsonSchema>;
+subscriptionCredentialImportProperties.credential = { ...subscriptionCredentialImportProperties.credential, writeOnly: true };
+registry.registerPath({
+  method: "post",
+  path: "/api/companies/{companyId}/ai-connections/subscription-credential",
+  tags: ["ai-connections"],
+  summary: "Import Codex or Grok native subscription credentials pending a runtime test",
+  description: "Board-only, company/owner-scoped import of a complete native CLI auth.json including refresh credentials. Provider is openai or xai; method is subscription. Imports are bounded, format-checked and encrypted without contacting a provider. Bare access tokens, API-key files and caller-selected Grok issuers are rejected. An explicit successful provider hello in the selected execution environment is required before normal runs may use this credential generation. Reconnect preserves identity and access; credentials are never returned. CLI refreshes are persisted through the existing identity-checked credential merge.",
+  request: { params: paramsSchemaFromPath("/api/companies/{companyId}/ai-connections/subscription-credential"),
+    body: { required: true, content: { "application/json": { schema: subscriptionCredentialImportBody } } } },
+  responses: {
+    201: { ...r.ok(z.object({ connectionId: z.string().uuid(), grantId: z.string().uuid(), validationStatus: z.literal("pending") })),
+      headers: { "Cache-Control": { schema: { type: "string", enum: ["no-store"] } } } },
+    400: r.badRequest, 401: r.unauthorized, 403: r.forbidden, 404: r.notFound, 422: r.unprocessable,
+  },
 });
 
 const claudeOauthTokenImportBody = zodToOpenApiSchema(importClaudeOauthTokenSchema);

@@ -461,7 +461,7 @@ describe("managed AI connections", () => {
       await Promise.all([parent.cleanup(), child.cleanup()]);
     }
   });
-  it("persists the freshest refreshed credential to its original grant across a same-account reconnect", async () => {
+  it("persists refreshes until an explicit same-account reconnect starts a new credential lineage", async () => {
     const auth = (marker: string, hour: number) => JSON.stringify({ tokens: { account_id: "fixture-account", id_token: `id-${marker}`, access_token: `access-${marker}`, refresh_token: `refresh-${marker}` }, last_refresh: `2026-09-10T${hour}:00:00Z` });
     const intent = { provider: "openai" as const, method: "subscription" as const, name: "Refresh test", ownership: "personal" as const, agentIds: [], allAgents: true, loginSessionId: "fixture" };
     const saved = await service.save(companyId, "alice", intent, auth("first", 10));
@@ -478,8 +478,9 @@ describe("managed AI connections", () => {
     await service.save(companyId, "alice", { ...intent, connectionId: saved.connectionId }, auth("reconnect", 12));
     await writeFile(path.join(String(second.config.env.CODEX_HOME), "auth.json"), auth("later-refresh", 13));
     await second.cleanup();
-    // The newer refresh persists to the grant it started from.
-    expect(await service.credential(await service.select({ ...runInput, userId: "alice" }))).toBe(auth("later-refresh", 13));
+    // A later timestamp from the old refresh-token lineage cannot replace
+    // the credential explicitly installed by the reconnect.
+    expect(await service.credential(await service.select({ ...runInput, userId: "alice" }))).toBe(auth("reconnect", 12));
   });
   it("resolves two concurrent OpenAI subscription write-backs by freshness, not by order", async () => {
     const userId = "concurrent-freshness-user";

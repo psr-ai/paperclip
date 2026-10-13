@@ -970,10 +970,12 @@ describe("grok_local execute", () => {
       expect(await pathExists(stagedDir)).toBe(false);
     });
 
-    it("a remote run copies the refreshed sandbox credential to the company Grok home", async () => {
+    it.each([false, true])("a remote run preserves refreshed auth in the selected home with managed connection %s", async (managed) => {
       delete process.env.XAI_API_KEY;
       mocks.state.isRemote = true;
       const hostGrokHome = await seedHostGrokAuth(grokAuth({ key: "host-key", expiresAt: OLDER_EXPIRY }));
+      const selectedHome = managed ? await makeTempRoot() : hostGrokHome;
+      if (managed) await fs.writeFile(path.join(selectedHome, "auth.json"), grokAuth({ key: "host-key", expiresAt: OLDER_EXPIRY }));
       const refreshedAuth = grokAuth({ key: "refreshed-key", expiresAt: NEWER_EXPIRY });
       sandboxAuthFixture.bytes = Buffer.from(refreshedAuth, "utf8");
       runProcessMock.mockImplementation(async () => makeSuccessfulRunResult());
@@ -990,9 +992,12 @@ describe("grok_local execute", () => {
         };
       });
 
-      await execute(await makeCtx("run-copyout-e2e", await makeTempRoot()));
+      const ctx = await makeCtx("run-copyout-e2e", await makeTempRoot());
+      if (managed) ctx.config = { ...ctx.config, managedAiConnection: { provider: "xai" }, env: { GROK_HOME: selectedHome } };
+      await execute(ctx);
 
-      expect(await fs.readFile(path.join(hostGrokHome, "auth.json"), "utf8")).toBe(refreshedAuth);
+      expect(await fs.readFile(path.join(selectedHome, "auth.json"), "utf8")).toBe(refreshedAuth);
+      if (managed) expect(await fs.readFile(path.join(hostGrokHome, "auth.json"), "utf8")).toBe(grokAuth({ key: "host-key", expiresAt: OLDER_EXPIRY }));
     });
 
     it("the copy-out installs to the resolver directory when env.GROK_HOME names a different directory, and the named directory stays empty", async () => {
@@ -1024,7 +1029,7 @@ describe("grok_local execute", () => {
       await expect(fs.readFile(path.join(attackerDir, "auth.json"), "utf8")).rejects.toThrow();
     });
 
-    it("a copy-out failure does not fail the run", async () => {
+    it.each([false, true])("a copy-out failure is surfaced only for managed connection %s", async (managed) => {
       delete process.env.XAI_API_KEY;
       mocks.state.isRemote = true;
       const hostGrokHome = await seedHostGrokAuth(grokAuth({ key: "host-key", expiresAt: OLDER_EXPIRY }));
@@ -1043,9 +1048,16 @@ describe("grok_local execute", () => {
         };
       });
 
-      const result = await execute(await makeCtx("run-copyout-failure", await makeTempRoot()));
+      const ctx = await makeCtx("run-copyout-failure", await makeTempRoot());
+      if (managed) ctx.config = { ...ctx.config, managedAiConnection: { provider: "xai" }, env: { GROK_HOME: hostGrokHome } };
+      const result = await execute(ctx);
 
       expect(result.exitCode).toBe(0);
+      if (managed) {
+        expect(result.errorCode).toBe("workspace_restore_failed");
+        expect(result.errorMessage).toContain("Workspace restore failed.");
+        expect(result.errorMessage).not.toContain("sandbox read boom");
+      } else expect(result.errorCode).toBeUndefined();
       // The host credential is untouched by the failed copy-out.
       expect(await fs.readFile(path.join(hostGrokHome, "auth.json"), "utf8")).toBe(
         grokAuth({ key: "host-key", expiresAt: OLDER_EXPIRY }),

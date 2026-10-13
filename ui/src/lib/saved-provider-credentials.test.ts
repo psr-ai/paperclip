@@ -29,17 +29,18 @@ const personal = (key = "ANTHROPIC_API_KEY.setup.abc", overrides = {}) =>
     secret: secret({ scope: "user" }),
   }) as MyUserSecretEntry;
 describe("saved provider keys", () => {
-  it("keeps an imported unverified default selectable for explicit testing without accepting revoked accounts", () => {
-    const account = { id: "connection", grantId: "grant", companyId: "c1", provider: "anthropic", method: "subscription",
-      name: "Imported Claude", ownership: "personal", ownerUserId: "user", isDefault: true,
+  it.each(["anthropic", "openai", "xai"] as const)("keeps an imported %s default selectable for explicit testing without accepting revoked accounts", provider => {
+    const account = { id: "connection", grantId: "grant", companyId: "c1", provider, method: "subscription",
+      name: "Imported account", ownership: "personal", ownerUserId: "user", isDefault: true,
       status: "needs_attention", credentialValidationPending: true } as AiManagedConnectionSummary;
-    const choices = savedManagedProviderAccounts("c1", "anthropic", "user", [account]);
+    const choices = savedManagedProviderAccounts("c1", provider, "user", [account]);
     expect(choices).toEqual([expect.objectContaining({ credentialValidationPending: true,
-      label: "Imported Claude (Your default) · Test required",
-      aiConnection: { provider: "anthropic", method: "subscription", mode: "responsible_user" },
+      label: "Imported account (Your default) · Test required",
+      aiConnection: { provider, method: "subscription", mode: "responsible_user" },
     })]);
-    expect(savedManagedProviderAccounts("c1", "anthropic", "user", [{ ...account, status: "revoked" }])).toEqual([]);
-    expect(savedManagedProviderAccounts("c2", "anthropic", "user", [account])).toEqual([]);
+    expect(savedManagedProviderAccounts("c1", provider, "user", [{ ...account, status: "revoked" }])).toEqual([]);
+    expect(savedManagedProviderAccounts("c2", provider, "user", [account])).toEqual([]);
+    expect(savedManagedProviderAccounts("c1", provider, "user", [{ ...account, method: "api_key" }])).toEqual([]);
   });
   it("reuses canonical and setup keys with references, including normalized organization keys", () => {
     expect(

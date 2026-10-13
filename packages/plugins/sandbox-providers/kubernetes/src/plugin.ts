@@ -120,9 +120,9 @@ const RESUME_READY_TIMEOUT_MS = 30_000;
 const RESUME_READY_POLL_MS = 1_000;
 
 // The workspace remote dir is the confinement root for native file sync. It is
-// recorded on the lease metadata at realizeWorkspace time (`remoteCwd`); require
-// it so a sync can never run without a concrete root to confine every sandbox
-// path against.
+// recorded at acquisition for the pod's mounted /workspace, then overridden by
+// workspace realization when needed. Require it so a sync can never run without
+// a concrete root to confine every sandbox path against.
 function resolveSyncRemoteDir(lease: PluginEnvironmentLease): string {
   const remoteCwd = lease.metadata?.remoteCwd;
   if (typeof remoteCwd === "string" && remoteCwd.trim().length > 0) {
@@ -448,6 +448,9 @@ const plugin = definePlugin({
     const podName = await orchestrator.findPod(clients, namespace, jobName);
 
     const leaseMetadata: KubernetesLeaseMetadata = {
+      // The pod already mounts this root. Adapter tests can use the original
+      // acquired lease for native sync before realization metadata is merged.
+      remoteCwd: "/workspace",
       namespace,
       jobName,
       podName,

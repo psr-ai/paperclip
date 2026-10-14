@@ -2325,7 +2325,7 @@ describe("sandbox adapter execution targets", () => {
         auth: req.headers.authorization ?? null,
         runId: typeof req.headers["x-paperclip-run-id"] === "string" ? req.headers["x-paperclip-run-id"] : null,
       });
-      res.writeHead(200, { "content-type": "application/json" });
+      res.writeHead(200, { "content-type": "application/json", "cache-control": "no-store" });
       res.end(JSON.stringify({ ok: true }));
     });
     await new Promise<void>((resolve, reject) => {
@@ -2377,6 +2377,23 @@ describe("sandbox adapter execution targets", () => {
         auth: "Bearer real-run-jwt",
         runId: "run-bridge",
       }]);
+
+      const secretResponse = await fetch(`${bridge!.env.PAPERCLIP_API_URL}/api/agents/me/secrets/GH_TOKEN/value`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${bridge!.env.PAPERCLIP_API_KEY}`,
+          "x-paperclip-run-id": "forged-run",
+        },
+      });
+      expect(secretResponse.status).toBe(200);
+      expect(secretResponse.headers.get("cache-control")).toBe("no-store");
+      expect(await secretResponse.json()).toEqual({ ok: true });
+      expect(requests[1]).toEqual({
+        method: "POST",
+        url: "/api/agents/me/secrets/GH_TOKEN/value",
+        auth: "Bearer real-run-jwt",
+        runId: "run-bridge",
+      });
     } finally {
       await bridge?.stop();
       await new Promise<void>((resolve) => apiServer.close(() => resolve()));

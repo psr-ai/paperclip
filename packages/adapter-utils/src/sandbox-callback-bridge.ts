@@ -127,6 +127,10 @@ export const DEFAULT_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST: readonly SandboxCa
   { method: "POST", path: /^\/runtime-tools\/github\/credentials$/ },
   // Identity, inbox, agent self-management
   { method: "GET", path: /^\/api\/agents\/me$/ },
+  // Run-bound granted-secret reads. The controller still verifies the active
+  // run, agent/company identity and binding, and registers values for redaction.
+  { method: "GET", path: /^\/api\/agents\/me\/secrets$/ },
+  { method: "POST", path: /^\/api\/agents\/me\/secrets\/(?!\.{1,2}\/)[A-Za-z0-9_.-]+\/value$/ },
   { method: "GET", path: /^\/api\/agents\/me\/inbox-lite$/ },
   { method: "GET", path: /^\/api\/agents\/me\/inbox\/mine$/ },
   { method: "GET", path: /^\/api\/agents\/[^/]+$/ },
@@ -527,11 +531,13 @@ export async function createSandboxCallbackBridgeAsset(): Promise<SandboxCallbac
 export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallbackBridgeQueueClient {
   return {
     makeDir: async (remotePath) => {
-      await fs.mkdir(remotePath, { recursive: true });
+      await fs.mkdir(remotePath, { recursive: true, mode: 0o700 });
+      await fs.chmod(remotePath, 0o700);
     },
     makeDirs: async (remotePaths) => {
       for (const remotePath of remotePaths) {
-        await fs.mkdir(remotePath, { recursive: true });
+        await fs.mkdir(remotePath, { recursive: true, mode: 0o700 });
+        await fs.chmod(remotePath, 0o700);
       }
     },
     listJsonFiles: async (remotePath) => {
@@ -635,7 +641,8 @@ export function createFileSystemSandboxCallbackBridgeQueueClient(): SandboxCallb
         if (responseExists) {
           return { wrote: false };
         }
-        await fs.writeFile(tempPath, body, "utf8");
+        await fs.writeFile(tempPath, body, { encoding: "utf8", mode: 0o600 });
+        await fs.chmod(tempPath, 0o600);
         await fs.rename(tempPath, responsePath);
         return { wrote: true };
       } finally {
@@ -666,14 +673,14 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
 
   return {
     makeDir: async (remotePath) => {
-      await runChecked(`mkdir ${remotePath}`, `mkdir -p ${shellQuote(remotePath)}`);
+      await runChecked(`mkdir ${remotePath}`, `umask 077 && mkdir -p ${shellQuote(remotePath)} && chmod 700 ${shellQuote(remotePath)}`);
     },
     makeDirs: async (remotePaths) => {
       if (remotePaths.length === 0) {
         return;
       }
       const quoted = remotePaths.map((remotePath) => shellQuote(remotePath));
-      await runChecked(`mkdir ${remotePaths.join(" ")}`, `mkdir -p ${quoted.join(" ")}`);
+      await runChecked(`mkdir ${remotePaths.join(" ")}`, `umask 077 && mkdir -p ${quoted.join(" ")} && chmod 700 ${quoted.join(" ")}`);
     },
     listJsonFiles: async (remotePath) => {
       const result = await runShell(
@@ -763,6 +770,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
         input.remoteCwd,
         [
           "set -eu",
+          "umask 077",
           `response_dir=${shellQuote(responseDir)}`,
           `response_path=${shellQuote(responsePath)}`,
           `temp_path=${shellQuote(tempPath)}`,
@@ -781,6 +789,7 @@ export function createCommandManagedSandboxCallbackBridgeQueueClient(input: {
           "  printf '{\"wrote\":false}\\n'",
           "  exit 0",
           "fi",
+          "touch \"$temp_path\" && chmod 600 \"$temp_path\"",
           "cat > \"$temp_path\"",
           "mv \"$temp_path\" \"$response_path\"",
           "printf '{\"wrote\":true}\\n'",
@@ -2421,20 +2430,23 @@ async function runFileGateway() {
     return entries.filter((entry) => entry.isFile() && entry.name.endsWith(".json")).length;
   }
 
-  // Delete request files older than the response deadline. Every live caller
+  // Delete queue files older than the response deadline. Every live caller
   // cleans its own request file when it times out, so a file this old is an
   // orphan: its writer was killed mid-wait, or a previous gateway process died
   // and left its queue behind. Orphans otherwise count toward the queue-depth
-  // cap forever and wedge the gateway at a permanent 503.
+  // cap forever and wedge the gateway at a permanent 503. An abandoned response
+  // can contain a granted credential, so expire those files on the same budget.
   async function sweepStaleRequests() {
     const staleBefore = Date.now() - responseTimeoutMs - 2000;
-    const entries = await fs.readdir(requestsDir, { withFileTypes: true }).catch(() => []);
-    for (const entry of entries) {
-      if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-      const filePath = path.posix.join(requestsDir, entry.name);
-      const stats = await fs.stat(filePath).catch(() => null);
-      if (stats && stats.mtimeMs < staleBefore) {
-        await fs.rm(filePath, { force: true }).catch(() => undefined);
+    for (const directory of [requestsDir, responsesDir]) {
+      const entries = await fs.readdir(directory, { withFileTypes: true }).catch(() => []);
+      for (const entry of entries) {
+        if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+        const filePath = path.posix.join(directory, entry.name);
+        const stats = await fs.stat(filePath).catch(() => null);
+        if (stats && stats.mtimeMs < staleBefore) {
+          await fs.rm(filePath, { force: true }).catch(() => undefined);
+        }
       }
     }
   }
@@ -2503,7 +2515,11 @@ async function runFileGateway() {
       const multipartAttachment = req.method === "POST"
         && /^\\/api\\/companies\\/[^/]+\\/issues\\/[^/]+\\/attachments$/.test(url.pathname)
         && /^multipart\\/form-data(?:;|$)/i.test(contentType);
-      if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !multipartAttachment) {
+      // The granted-secret API documents an empty POST with no Content-Type.
+      // Permit only that route and verify its actual body is empty below.
+      const bodylessSecretRead = req.method === "POST" && contentType === ""
+        && /^\\/api\\/agents\\/me\\/secrets\\/(?!\\.{1,2}\\/)[A-Za-z0-9_.-]+\\/value$/.test(url.pathname);
+      if (req.method && req.method !== "GET" && req.method !== "HEAD" && !/json/i.test(contentType) && !multipartAttachment && !bodylessSecretRead) {
         writeJsonResponse(res, 415, { error: "Bridge only accepts JSON request bodies." });
         return;
       }
@@ -2512,6 +2528,10 @@ async function runFileGateway() {
       // incoming byte buffers. Capacity rejection precedes dispatch, hence 503.
       const { body: requestBody, release } = await readBodyBytes(req);
       releaseBodyReservation = release;
+      if (bodylessSecretRead && requestBody.length !== 0) {
+        writeJsonResponse(res, 415, { error: "Bridge only accepts JSON request bodies." });
+        return;
+      }
       const reserveBytes = 4 * sandboxBridgeEnvelopeLimit(requestBody.length);
       if (!processBodyLedger.reserve(reserveBytes)) throw new BridgeProcessCapacityError();
       envelopeReservation = reserveBytes;
@@ -2526,7 +2546,7 @@ async function runFileGateway() {
       };
       const requestPath = path.posix.join(requestsDir, \`\${requestId}.json\`);
       const tempPath = \`\${requestPath}.tmp\`;
-      await fs.writeFile(tempPath, \`\${JSON.stringify(payload)}\\n\`, "utf8");
+      await fs.writeFile(tempPath, \`\${JSON.stringify(payload)}\\n\`, { encoding: "utf8", mode: 0o600 });
       dispatched = true;
       await fs.rename(tempPath, requestPath);
 
@@ -2582,17 +2602,21 @@ async function runFileGateway() {
   });
 
   async function shutdown() {
+    clearInterval(staleQueueSweep);
     server.close(() => {
       process.exit(0);
     });
   }
 
+  for (const directory of [queueDir, requestsDir, responsesDir, logsDir]) {
+    await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+    await fs.chmod(directory, 0o700);
+  }
+  await sweepStaleRequests();
+  const staleQueueSweep = setInterval(() => void sweepStaleRequests().catch(() => {}), Math.max(1000, responseTimeoutMs));
+  staleQueueSweep.unref();
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
-
-  await fs.mkdir(requestsDir, { recursive: true });
-  await fs.mkdir(responsesDir, { recursive: true });
-  await fs.mkdir(logsDir, { recursive: true });
 
   // Newer Node runtimes do not reliably surface a failed bind through
   // uncaughtException here: with nothing else keeping the event loop alive,

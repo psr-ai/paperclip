@@ -3283,6 +3283,7 @@ const AgentSecretListResponseSchema = z.object({
     z.object({
       secretRef: z.string().guid(),
       key: z.string(),
+      aliases: z.array(z.string()),
       name: z.string(),
       description: z.string().nullable(),
       delivery: z.enum(["env", "api", "both"]),
@@ -3404,6 +3405,7 @@ registry.registerPath({
   path: "/api/agents/me/secrets/{key}/value",
   tags: ["secrets"],
   summary: "Fetch one secret value for the current agent run",
+  description: "Accepts the canonical secret key or an exact granted access alias. Ambiguous names are rejected with 403. Alias reads use that binding's version selector.",
   request: { params: z.object({ key: z.string() }) },
   responses: {
     200: {

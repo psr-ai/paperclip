@@ -22,10 +22,11 @@ GET /api/agents/me/secrets
   "secrets": [
     {
       "key": "github_token",
+      "aliases": ["GH_TOKEN"],
       "secretRef": "11111111-1111-4111-8111-111111111111",
       "name": "GitHub token",
       "description": null,
-      "delivery": "env",
+      "delivery": "both",
       "projectionClass": "unclassified",
       "latestVersion": 2,
       "versionSelector": "latest",
@@ -40,6 +41,14 @@ not secret material or a capability; every consuming route re-authorizes it.
 The list never returns values, the internal `secretId` field, binding IDs, or
 config paths. An `env.*` binding implies read access through this API; an
 `access.*` binding grants API access without environment injection.
+
+`key` remains the canonical secret key. `aliases` lists the exact names granted
+through `access.<ALIAS>` bindings, such as `GH_TOKEN`; it is empty for env-only
+grants. Fetch using either the canonical key or a listed alias. An alias uses
+its own binding's version selector, so aliases for the same secret can resolve
+different pinned versions. A name matching distinct granted bindings (including
+an alias colliding with another secret's canonical key) is rejected with 403.
+Both list and value responses use `Cache-Control: no-store`.
 
 Fetch a value only when it is needed. The request has no body and the response
 uses `Cache-Control: no-store`:

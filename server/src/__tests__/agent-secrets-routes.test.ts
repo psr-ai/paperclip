@@ -183,10 +183,11 @@ describeEmbeddedPostgres("agent secret routes", () => {
 
     const list = await request(createApp(fixture)).get("/api/agents/me/secrets");
     expect(list.status).toBe(200);
+    expect(list.headers["cache-control"]).toBe("no-store");
     expect(list.body.secrets).toEqual([
-      expect.objectContaining({ key: "api_only_key", delivery: "api", projectionClass: "class_2_runtime_only" }),
-      expect.objectContaining({ key: "env_only_key", delivery: "env" }),
-      expect.objectContaining({ key: "project_key", delivery: "env" }),
+      expect.objectContaining({ key: "api_only_key", aliases: ["API_ONLY_KEY"], delivery: "api", projectionClass: "class_2_runtime_only" }),
+      expect.objectContaining({ key: "env_only_key", aliases: [], delivery: "env" }),
+      expect.objectContaining({ key: "project_key", aliases: [], delivery: "env" }),
     ]);
     expect(JSON.stringify(list.body)).not.toContain("secret-value");
     expect(await db.select().from(secretAccessEvents)).toEqual([]);
@@ -225,6 +226,151 @@ describeEmbeddedPostgres("agent secret routes", () => {
     expect(await db.select().from(activityLog)).not.toEqual(expect.arrayContaining([
       expect.objectContaining({ action: "secret.value.read", entityId: unboundSecret.id }),
     ]));
+  });
+
+  it("resolves granted aliases to their exact versions while retaining canonical keys", async () => {
+    const fixture = await seedAgentRun();
+    const svc = secretService(db);
+    const secret = await svc.create(fixture.companyId, {
+      key: "ray-github-pat", name: "GitHub", provider: "local_encrypted", value: "older-pat",
+    });
+    await svc.rotate(secret.id, { value: "newer-pat" });
+    await svc.createBinding({
+      companyId: fixture.companyId, secretId: secret.id, targetType: "agent", targetId: fixture.agentId,
+      configPath: "access.GH_TOKEN", versionSelector: 1,
+    });
+    await svc.createBinding({
+      companyId: fixture.companyId, secretId: secret.id, targetType: "agent", targetId: fixture.agentId,
+      configPath: "access.GH_CURRENT", versionSelector: "latest",
+    });
+    const ungrantedSecret = await svc.create(fixture.companyId, {
+      key: "not-granted", name: "Other agent", provider: "local_encrypted", value: "never-returned",
+    });
+    await svc.createBinding({
+      companyId: fixture.companyId, secretId: ungrantedSecret.id, targetType: "agent", targetId: randomUUID(),
+      configPath: "access.OTHER_AGENT_TOKEN",
+    });
+    const app = createApp(fixture);
+    const list = await request(app).get("/api/agents/me/secrets");
+    expect(list.status).toBe(200);
+    expect(list.body.secrets).toHaveLength(1);
+    expect(list.body.secrets[0]).toMatchObject({ key: secret.key, aliases: ["GH_CURRENT", "GH_TOKEN"] });
+    for (const field of ["bindingId", "configPath", "aliasBindings", "secretId"]) {
+      expect(list.body.secrets[0]).not.toHaveProperty(field);
+    }
+    expect(JSON.stringify(list.body)).not.toMatch(/older-pat|newer-pat|never-returned/);
+    for (const [key, value, version] of [["GH_TOKEN", "older-pat", 1], ["GH_CURRENT", "newer-pat", 2]] as const) {
+      const response = await request(app).post(`/api/agents/me/secrets/${key}/value`);
+      expect(response.status).toBe(200);
+      expect(response.body).toEqual({ key: secret.key, value, version });
+      expect(response.headers["cache-control"]).toBe("no-store");
+    }
+    const canonical = await request(app).post(`/api/agents/me/secrets/${secret.key}/value`);
+    expect(canonical.status).toBe(200);
+    expect(canonical.body.key).toBe(secret.key);
+    for (const key of ["OTHER_AGENT_TOKEN", ungrantedSecret.key, "gh_token"]) {
+      const denied = await request(app).post(`/api/agents/me/secrets/${key}/value`);
+      expect(denied.status).toBe(403);
+    }
+    expect(await db.select().from(secretAccessEvents).where(eq(secretAccessEvents.secretId, ungrantedSecret.id))).toEqual([]);
+    const reads = await db.select().from(activityLog);
+    expect(JSON.stringify(reads)).not.toMatch(/older-pat|newer-pat|never-returned/);
+    expect(reads).toEqual(expect.arrayContaining([
+      expect.objectContaining({ action: "secret.value.read", details: expect.objectContaining({ configPath: "access.GH_TOKEN" }) }),
+      expect.objectContaining({ action: "secret.value.read", details: expect.objectContaining({ configPath: "access.GH_CURRENT" }) }),
+    ]));
+  });
+
+  it("rejects alias and canonical-key collisions before resolving a value", async () => {
+    const fixture = await seedAgentRun();
+    const svc = secretService(db);
+    const canonical = await svc.create(fixture.companyId, {
+      key: "shared_name", name: "Canonical", provider: "local_encrypted", value: "canonical-value",
+    });
+    const aliased = await svc.create(fixture.companyId, {
+      key: "other_name", name: "Aliased", provider: "local_encrypted", value: "aliased-value",
+    });
+    await svc.createBinding({
+      companyId: fixture.companyId, secretId: canonical.id, targetType: "agent", targetId: fixture.agentId,
+      configPath: "env.CANONICAL",
+    });
+    await svc.createBinding({
+      companyId: fixture.companyId, secretId: aliased.id, targetType: "agent", targetId: fixture.agentId,
+      configPath: "access.shared_name",
+    });
+    const response = await request(createApp(fixture)).post("/api/agents/me/secrets/shared_name/value");
+    expect(response.status).toBe(403);
+    expect(await db.select().from(secretAccessEvents)).toEqual([]);
+    expect(await db.select().from(activityLog)).toEqual([]);
+  });
+
+  it("rejects conflicting aliases from distinct granted bindings", async () => {
+    const fixture = await seedAgentRun();
+    const svc = secretService(db);
+    const first = await svc.create(fixture.companyId, {
+      key: "first_token", name: "First", provider: "local_encrypted", value: "first-value",
+    });
+    const second = await svc.create(fixture.companyId, {
+      key: "second_token", name: "Second", provider: "local_encrypted", value: "second-value",
+    });
+    await svc.createBinding({
+      companyId: fixture.companyId, secretId: first.id, targetType: "agent", targetId: fixture.agentId,
+      configPath: "access.SHARED_TOKEN",
+    });
+    const runtimeBinding = await svc.createBinding({
+      companyId: fixture.companyId, secretId: second.id, targetType: "agent", targetId: randomUUID(),
+      configPath: "access.SHARED_TOKEN",
+    });
+    await db.update(heartbeatRuns).set({
+      contextSnapshot: { paperclipSecrets: { manifest: [{ bindingId: runtimeBinding.id }] } },
+    }).where(eq(heartbeatRuns.id, fixture.heartbeatRunId));
+    const response = await request(createApp(fixture)).post("/api/agents/me/secrets/SHARED_TOKEN/value");
+    expect(response.status).toBe(403);
+    expect(await db.select().from(secretAccessEvents)).toEqual([]);
+    expect(await db.select().from(activityLog)).toEqual([]);
+  });
+
+  it("accepts a canonical key that is also the same binding's alias", async () => {
+    const fixture = await seedAgentRun();
+    const svc = secretService(db);
+    const secret = await svc.create(fixture.companyId, {
+      key: "same_name", name: "Same", provider: "local_encrypted", value: "same-value",
+    });
+    await svc.createBinding({
+      companyId: fixture.companyId, secretId: secret.id, targetType: "agent", targetId: fixture.agentId,
+      configPath: "access.same_name",
+    });
+    const response = await request(createApp(fixture)).post("/api/agents/me/secrets/same_name/value");
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ key: "same_name", value: "same-value", version: 1 });
+  });
+
+  it("keeps alias access scoped to the company and a running heartbeat", async () => {
+    const fixture = await seedAgentRun();
+    const foreign = await seedAgentRun();
+    const svc = secretService(db);
+    for (const [owner, alias] of [[fixture, "OWN_TOKEN"], [foreign, "FOREIGN_TOKEN"]] as const) {
+      const secret = await svc.create(owner.companyId, {
+        key: "scoped_token", name: "Scoped", provider: "local_encrypted", value: "scoped-value",
+      });
+      await svc.createBinding({
+        companyId: owner.companyId, secretId: secret.id, targetType: "agent", targetId: owner.agentId,
+        configPath: `access.${alias}`,
+      });
+    }
+    const app = createApp(fixture);
+    expect((await request(app).post("/api/agents/me/secrets/FOREIGN_TOKEN/value")).status).toBe(403);
+    const mismatched = createApp({ ...fixture, companyId: foreign.companyId });
+    expect((await request(mismatched).get("/api/agents/me/secrets")).status).toBe(403);
+    expect((await request(mismatched).post("/api/agents/me/secrets/OWN_TOKEN/value")).status).toBe(403);
+    expect(await db.select().from(secretAccessEvents)).toEqual([]);
+
+    expect((await request(app).post("/api/agents/me/secrets/OWN_TOKEN/value")).status).toBe(200);
+    const readsBeforeCompletion = await db.select().from(secretAccessEvents);
+    await db.update(heartbeatRuns).set({ status: "succeeded" }).where(eq(heartbeatRuns.id, fixture.heartbeatRunId));
+    expect((await request(app).get("/api/agents/me/secrets")).status).toBe(403);
+    expect((await request(app).post("/api/agents/me/secrets/OWN_TOKEN/value")).status).toBe(403);
+    expect(await db.select().from(secretAccessEvents)).toEqual(readsBeforeCompletion);
   });
 
   it("fails closed when run redaction registration cannot be persisted", async () => {

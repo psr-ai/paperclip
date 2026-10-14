@@ -1,6 +1,6 @@
 import { execFile as execFileCallback, spawn } from "node:child_process";
 import { createServer } from "node:http";
-import { mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, stat, utimes, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
@@ -323,6 +323,126 @@ describe("sandbox callback bridge", () => {
     }
     expect(forwarded).toEqual(["GET /api/openapi.json"]);
   });
+
+  it.each(["queue_v1", "http2_v1"] as const)("relays only granted-secret endpoints over %s and preserves controller denials", async (mode) => {
+    const seen: Array<{ method: string; path: string; query: string; headers: Record<string, string>; body: string }> = [];
+    const forwardRequest = async (request: { method: string; path: string; query: string; headers: Record<string, string>; body: string | Buffer }) => {
+      seen.push({ ...request, body: request.body.toString() });
+      const denied = request.path.endsWith("/UNGRANTED/value");
+      return {
+        status: denied ? 403 : 200,
+        headers: { "content-type": "application/json", "cache-control": "no-store" },
+        body: Buffer.from(JSON.stringify(denied ? { error: "Secret access is not granted for this agent" } : { fixture: true })),
+      };
+    };
+    const bridgeToken = createSandboxCallbackBridgeToken();
+    let baseUrl: string;
+    let queueDirectories: ReturnType<typeof sandboxCallbackBridgeDirectories> | undefined;
+    if (mode === "queue_v1") {
+      const fixture = await prepareGatewayFixture("paperclip-bridge-secret-");
+      queueDirectories = fixture.directories;
+      const worker = await startSandboxCallbackBridgeWorker({
+        client: createFileSystemSandboxCallbackBridgeQueueClient(), queueDir: fixture.queueDir,
+        handleRequest: forwardRequest,
+      });
+      cleanupFns.push(() => worker.stop());
+      const bridge = await startSandboxCallbackBridgeServer({ ...fixture, bridgeToken, timeoutMs: 30_000 });
+      cleanupFns.push(() => bridge.stop());
+      baseUrl = bridge.baseUrl;
+    } else {
+      baseUrl = (await startHttp2GatewayForTest({
+        bridgeToken,
+        forwardRequest: (request) => forwardRequest({ ...request, path: request.pathname }),
+      })).baseUrl;
+    }
+    const headers = { authorization: `Bearer ${bridgeToken}`, "x-paperclip-run-id": "forged-run", "x-extra-secret-header": "drop-me" };
+    for (const [method, route] of [
+      ["GET", "/api/agents/me/secrets?view=metadata"],
+      ["POST", "/api/agents/me/secrets/GH_TOKEN/value"],
+    ]) {
+      const response = await fetch(`${baseUrl}${route}`, { method, headers });
+      expect(response.status).toBe(200);
+      expect(response.headers.get("cache-control")).toBe("no-store");
+      await expect(response.json()).resolves.toEqual({ fixture: true });
+    }
+    const denied = await fetch(`${baseUrl}/api/agents/me/secrets/UNGRANTED/value`, { method: "POST", headers });
+    expect(denied.status).toBe(403);
+    await expect(denied.json()).resolves.toEqual({ error: "Secret access is not granted for this agent" });
+    const unauthorized = await fetch(`${baseUrl}/api/agents/me/secrets/GH_TOKEN/value`, {
+      method: "POST", headers: { authorization: "Bearer invalid" },
+    });
+    expect(unauthorized.status).toBe(401);
+    await unauthorized.arrayBuffer();
+    const wrongMethod = await fetch(`${baseUrl}/api/agents/me/secrets/GH_TOKEN/value`, { headers });
+    expect(wrongMethod.status).toBe(403);
+    await wrongMethod.arrayBuffer();
+    expect(seen.map(({ method, path, query, body }) => ({ method, path, query, body }))).toEqual([
+      { method: "GET", path: "/api/agents/me/secrets", query: "?view=metadata", body: "" },
+      { method: "POST", path: "/api/agents/me/secrets/GH_TOKEN/value", query: "", body: "" },
+      { method: "POST", path: "/api/agents/me/secrets/UNGRANTED/value", query: "", body: "" },
+    ]);
+    for (const request of seen) {
+      expect(request.headers.authorization).toBeUndefined();
+      expect(request.headers["x-paperclip-run-id"]).toBeUndefined();
+      expect(request.headers["x-extra-secret-header"]).toBeUndefined();
+    }
+    if (queueDirectories) {
+      expect(await readdir(queueDirectories.responsesDir)).toEqual([]);
+      for (const directory of [queueDirectories.rootDir, queueDirectories.requestsDir, queueDirectories.responsesDir]) {
+        expect((await stat(directory)).mode & 0o777).toBe(0o700);
+      }
+    }
+  }, 30_000);
+
+  it("keeps the bodyless secret POST exception confined to an empty body without a content type", async () => {
+    const fixture = await prepareGatewayFixture("paperclip-bridge-secret-body-");
+    const bridge = await startSandboxCallbackBridgeServer({ ...fixture, timeoutMs: 30_000 });
+    cleanupFns.push(() => bridge.stop());
+    for (const request of [
+      { path: "/api/agents/me/secrets/GH_TOKEN/value", body: Buffer.from("not-json") },
+      { path: "/api/issues/issue-1/comments" },
+      { path: "/api/agents/me/secrets/GH_TOKEN/value", contentType: "text/plain" },
+    ]) {
+      const response = await fetch(`${bridge.baseUrl}${request.path}`, {
+        method: "POST",
+        headers: { authorization: `Bearer ${fixture.bridgeToken}`, ...(request.contentType ? { "content-type": request.contentType } : {}) },
+        body: request.body,
+      });
+      expect(response.status).toBe(415);
+      await response.arrayBuffer();
+    }
+    expect(await readdir(fixture.directories.requestsDir)).toEqual([]);
+  }, 15_000);
+
+  it.each(["filesystem", "exec"] as const)("writes private response files with the %s queue client", async (transport) => {
+    const root = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-private-"));
+    cleanupDirs.push(root);
+    const directory = path.join(root, "responses");
+    await mkdir(directory, { mode: 0o755 });
+    await chmod(directory, 0o755);
+    const client = transport === "filesystem" ? createFileSystemSandboxCallbackBridgeQueueClient()
+      : createCommandManagedSandboxCallbackBridgeQueueClient({ runner: createExecRunner(), remoteCwd: root });
+    await client.makeDir(directory);
+    const responsePath = path.join(directory, "fixture.json");
+    await client.writeResponseFile!(responsePath, JSON.stringify({ fixture: true }));
+    expect((await stat(directory)).mode & 0o777).toBe(0o700);
+    expect((await stat(responsePath)).mode & 0o777).toBe(0o600);
+    expect(await readdir(directory)).toEqual(["fixture.json"]);
+  });
+
+  it("removes orphaned response files on queue gateway startup without deleting fresh responses", async () => {
+    const fixture = await prepareGatewayFixture("paperclip-bridge-secret-orphan-");
+    await mkdir(fixture.directories.responsesDir, { recursive: true });
+    const expired = path.join(fixture.directories.responsesDir, "expired.json");
+    const fresh = path.join(fixture.directories.responsesDir, "fresh.json");
+    await writeFile(expired, "expired-fixture");
+    await writeFile(fresh, "fresh-fixture");
+    const old = new Date(Date.now() - 60_000);
+    await utimes(expired, old, old);
+    const bridge = await startSandboxCallbackBridgeServer({ ...fixture, timeoutMs: 30_000 });
+    cleanupFns.push(() => bridge.stop());
+    expect(await readdir(fixture.directories.responsesDir)).toEqual(["fresh.json"]);
+  }, 15_000);
 
   it("denies non-allowlisted requests by default", async () => {
     const rootDir = await mkdtemp(path.join(os.tmpdir(), "paperclip-bridge-default-policy-"));
@@ -1375,6 +1495,42 @@ describe("sandbox callback bridge", () => {
 
     // Nothing was written to the remote path on the failure path.
     await expect(readFile(remotePath, "utf8")).rejects.toThrow();
+  });
+
+  it("allows only self granted-secret reads on both transport route lists", () => {
+    for (const routes of [undefined, HTTP2_SANDBOX_CALLBACK_BRIDGE_ROUTE_ALLOWLIST]) {
+      for (const request of [
+        { method: "GET", path: "/api/agents/me/secrets" },
+        { method: "POST", path: "/api/agents/me/secrets/GH_TOKEN/value" },
+        { method: "POST", path: "/api/agents/me/secrets/ray-github.pat/value" },
+        { method: "POST", path: `/api/agents/me/secrets/${"A".repeat(121)}/value` },
+      ]) {
+        expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request, routes)).toBeNull();
+      }
+      for (const request of [
+        { method: "POST", path: "/api/agents/me/secrets" },
+        { method: "GET", path: "/api/agents/me/secrets/GH_TOKEN/value" },
+        { method: "PATCH", path: "/api/agents/me/secrets/GH_TOKEN/value" },
+        { method: "DELETE", path: "/api/agents/me/secrets/GH_TOKEN/value" },
+        { method: "GET", path: "/api/agents/other-agent/secrets" },
+        { method: "POST", path: "/api/agents/other-agent/secrets/GH_TOKEN/value" },
+        { method: "GET", path: "/api/companies/company-1/secrets" },
+        { method: "POST", path: "/api/companies/company-1/secrets/secret-1/rotate" },
+        { method: "POST", path: "/api/agents/me/secrets/GH_TOKEN/value/extra" },
+        { method: "POST", path: "/api/agents/me/secrets//value" },
+        { method: "POST", path: "/api/agents/me/secrets/./value" },
+        { method: "POST", path: "/api/agents/me/secrets/../value" },
+        { method: "POST", path: "/api/agents/me/secrets/GH/TOKEN/value" },
+        { method: "POST", path: "/api/agents/me/secrets/GH\\TOKEN/value" },
+        { method: "POST", path: "/api/agents/me/secrets/GH%2fTOKEN/value" },
+        { method: "POST", path: "/api/agents/me/secrets/GH%5cTOKEN/value" },
+        { method: "POST", path: "/api/agents/me/secrets/GH%252fTOKEN/value" },
+        { method: "POST", path: "/api/agents/me/secrets/GH_TOKEN?ignored=/value" },
+        { method: "GET", path: "/api/agents/me/secrets?ignored=/api/secrets" },
+      ]) {
+        expect(authorizeSandboxCallbackBridgeRequestWithRoutes(request, routes)).toBe(`Route not allowed: ${request.method} ${request.path}`);
+      }
+    }
   });
 
   it("permits the documented heartbeat surface and denies unrelated routes", () => {

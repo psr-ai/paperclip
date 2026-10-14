@@ -669,6 +669,14 @@ export type AgentSecretAccessEntry = {
   bindingId: string;
   configPath: string;
   key: string;
+  aliases: string[];
+  /** Internal resolution data; never serialize binding details in agent metadata. */
+  aliasBindings: Array<{
+    alias: string;
+    bindingId: string;
+    configPath: string;
+    versionSelector: SecretVersionSelector;
+  }>;
   name: string;
   description: string | null;
   delivery: "env" | "api" | "both";
@@ -1840,12 +1848,22 @@ export function secretService(db: Db | DbTransaction) {
       const versionSelector: SecretVersionSelector = selectedBinding.versionSelector === "latest"
         ? "latest"
         : Number(selectedBinding.versionSelector);
+      const aliasBindings: AgentSecretAccessEntry["aliasBindings"] = secretBindings
+        .filter((binding) => binding.configPath.startsWith(AGENT_ACCESS_CONFIG_PATH_PREFIX))
+        .map((binding) => ({
+          alias: binding.configPath.slice(AGENT_ACCESS_CONFIG_PATH_PREFIX.length),
+          bindingId: binding.id,
+          configPath: binding.configPath,
+          versionSelector: binding.versionSelector === "latest" ? "latest" : Number(binding.versionSelector),
+        }));
       const delivery: AgentSecretAccessEntry["delivery"] = hasEnv && hasApi ? "both" : hasEnv ? "env" : "api";
       return [{
         secretId,
         bindingId: selectedBinding.id,
         configPath: selectedBinding.configPath,
         key: secret.key,
+        aliases: [...new Set(aliasBindings.map((binding) => binding.alias))].sort(),
+        aliasBindings,
         name: secret.name,
         description: secret.description ?? null,
         delivery,

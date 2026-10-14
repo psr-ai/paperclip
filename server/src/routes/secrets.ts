@@ -325,8 +325,9 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
       runId: context.heartbeatRunId,
       details: { count: secrets.length },
     });
+    res.set("Cache-Control", "no-store");
     res.json({
-      secrets: secrets.map(({ secretId, bindingId: _bindingId, configPath: _configPath, ...secret }) => ({
+      secrets: secrets.map(({ secretId, bindingId: _bindingId, configPath: _configPath, aliasBindings: _aliasBindings, ...secret }) => ({
         ...secret,
         secretRef: secretId,
       })),
@@ -336,7 +337,16 @@ export function secretRoutes(db: Db, deps: SecretRoutesDeps = {}) {
   router.post("/agents/me/secrets/:key/value", async (req, res) => {
     const context = agentSecretContext(req);
     const available = await svc.listAgentSecretAccess(context.companyId, context);
-    const secret = available.find((entry) => entry.key === req.params.key);
+    // Resolve only granted names. Never let an alias shadow a canonical key or
+    // another binding, including aliases pinned to different secret versions.
+    const candidates = available.flatMap((entry) => [
+      ...(entry.key === req.params.key ? [entry] : []),
+      ...entry.aliasBindings
+        .filter((binding) => binding.alias === req.params.key)
+        .map((binding) => ({ ...entry, ...binding })),
+    ]);
+    const uniqueCandidates = new Map(candidates.map((entry) => [entry.bindingId, entry]));
+    const secret = uniqueCandidates.size === 1 ? uniqueCandidates.values().next().value : null;
     if (!secret) throw forbidden("Secret access is not granted for this agent");
     const resolution = await svc.resolveSecretValueForAgentAccess(
       context.companyId,

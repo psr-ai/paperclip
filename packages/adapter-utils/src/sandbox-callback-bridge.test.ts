@@ -346,7 +346,7 @@ describe("sandbox callback bridge", () => {
         handleRequest: forwardRequest,
       });
       cleanupFns.push(() => worker.stop());
-      const bridge = await startSandboxCallbackBridgeServer({ ...fixture, bridgeToken, timeoutMs: 30_000 });
+      const bridge = await startSandboxCallbackBridgeServer({ ...fixture, remoteCwd: fixture.remoteWorkspaceDir, bridgeToken, timeoutMs: 30_000 });
       cleanupFns.push(() => bridge.stop());
       baseUrl = bridge.baseUrl;
     } else {
@@ -396,7 +396,7 @@ describe("sandbox callback bridge", () => {
 
   it("keeps the bodyless secret POST exception confined to an empty body without a content type", async () => {
     const fixture = await prepareGatewayFixture("paperclip-bridge-secret-body-");
-    const bridge = await startSandboxCallbackBridgeServer({ ...fixture, timeoutMs: 30_000 });
+    const bridge = await startSandboxCallbackBridgeServer({ ...fixture, remoteCwd: fixture.remoteWorkspaceDir, timeoutMs: 30_000 });
     cleanupFns.push(() => bridge.stop());
     for (const request of [
       { path: "/api/agents/me/secrets/GH_TOKEN/value", body: Buffer.from("not-json") },
@@ -439,7 +439,7 @@ describe("sandbox callback bridge", () => {
     await writeFile(fresh, "fresh-fixture");
     const old = new Date(Date.now() - 60_000);
     await utimes(expired, old, old);
-    const bridge = await startSandboxCallbackBridgeServer({ ...fixture, timeoutMs: 30_000 });
+    const bridge = await startSandboxCallbackBridgeServer({ ...fixture, remoteCwd: fixture.remoteWorkspaceDir, timeoutMs: 30_000 });
     cleanupFns.push(() => bridge.stop());
     expect(await readdir(fixture.directories.responsesDir)).toEqual(["fresh.json"]);
   }, 15_000);

@@ -70,7 +70,7 @@ human-only controls, approvals, identity linking, or a human Slack user's search
 and tool privileges. Normal task, agent, connection, and approval restrictions
 continue to apply.
 
-Admission is limited to three bot turns per original Slack thread and ten per
+Admission is limited to eight bot turns per original Slack thread and ten per
 endpoint in a rolling minute. The limits are durable and checked under the
 endpoint's transaction lock. Duplicate deliveries do not consume additional
 turns. The thread limit spans conversation/session generations. Start a new

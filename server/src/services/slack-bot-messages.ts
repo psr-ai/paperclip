@@ -1,6 +1,6 @@
 import { updateChatEndpointSchema } from "@paperclipai/shared";
 
-export const SLACK_BOT_THREAD_TURN_LIMIT = 3;
+export const SLACK_BOT_THREAD_TURN_LIMIT = 8;
 export const SLACK_BOT_ENDPOINT_MINUTE_LIMIT = 10;
 export const SLACK_BOT_MESSAGE_DENIED = "Slack bot message is not authorized";
 export const SLACK_BOT_BUDGET_EXHAUSTED = "Slack bot reply budget exhausted";

@@ -22321,11 +22321,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       await f.send("9900.2", { mentioned: false });
       await f.send("9900.3", { userId: "U0UNGRANTEDBOT" });
       expect(f.wakeup).toHaveBeenCalledTimes(1);
-      await f.send("9900.4");
-      await f.send("9900.5");
-      await f.send("9900.6");
-      expect(f.wakeup).toHaveBeenCalledTimes(3);
-      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.fixture.companyId))).toHaveLength(3);
+      for (let index = 4; index <= 10; index++) await f.send(`9900.${index}`);
+      expect(f.wakeup).toHaveBeenCalledTimes(8);
+      await f.send("9900.11");
+      expect(f.wakeup).toHaveBeenCalledTimes(8);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.fixture.companyId))).toHaveLength(8);
       const deliveries = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
       expect(deliveries.some((row) => row.redactedError === "Slack bot reply budget exhausted")).toBe(true);
     });
@@ -22421,9 +22421,8 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const f = await botFixture();
       await f.send("9900.1");
       await f.send("9900.1");
-      await f.send("9900.2");
-      await f.send("9900.3");
-      expect(f.wakeup).toHaveBeenCalledTimes(3);
+      for (let index = 2; index <= 8; index++) await f.send(`9900.${index}`);
+      expect(f.wakeup).toHaveBeenCalledTimes(8);
       const [conversation] = await f.service.listConversations(f.endpoint.id);
       // Session turnover must not give the same provider thread a fresh loop budget.
       await db.update(chatConversations).set({ sessionGeneration: 2 }).where(eq(chatConversations.id, conversation!.id));
@@ -22435,10 +22434,10 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       // runtimeFor may be lazy until a callback is needed.
       if (!callbacks) await fresh.service.handleWebhook(f.endpoint.publicId, "slack", new Request("https://paperclip.example/slack", { method: "POST", body: "{}", headers: { "content-type": "application/json" } }));
       const restartedCallbacks = fresh.runtime.configurations.get(f.endpoint.id)!.callbacks;
-      await deliverMessage({ callbacks: restartedCallbacks, endpointId: f.endpoint.id, thread: f.thread().thread, message: f.message("9900.4"), trigger: "mention" });
+      await deliverMessage({ callbacks: restartedCallbacks, endpointId: f.endpoint.id, thread: f.thread().thread, message: f.message("9900.9"), trigger: "mention" });
       expect(fresh.wakeup).not.toHaveBeenCalled();
       const deliveries = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
-      expect(deliveries.filter((row) => row.state === "processed")).toHaveLength(3);
+      expect(deliveries.filter((row) => row.state === "processed")).toHaveLength(8);
       expect(deliveries).toContainEqual(expect.objectContaining({ state: "filtered", redactedError: "Slack bot reply budget exhausted" }));
     });
 
@@ -22461,16 +22460,15 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
 
     it("serializes simultaneous bot turns at the final remaining thread-budget slot", async () => {
       const f = await botFixture();
-      await f.send("9900.1");
-      await f.send("9900.2");
-      const results = await Promise.allSettled([f.send("9900.3"), f.send("9900.4")]);
+      for (let index = 1; index <= 7; index++) await f.send(`9900.${index}`);
+      const results = await Promise.allSettled([f.send("9900.8"), f.send("9900.9")]);
       expect(results.every((result) => result.status === "fulfilled")).toBe(true);
       await f.service.processPendingDeliveries();
-      expect(f.wakeup).toHaveBeenCalledTimes(3);
+      expect(f.wakeup).toHaveBeenCalledTimes(8);
       const intents = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "inbound_wakeup")));
-      expect(intents).toHaveLength(3);
+      expect(intents).toHaveLength(8);
       const deliveries = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
-      expect(deliveries.filter((row) => row.state === "processed")).toHaveLength(3);
+      expect(deliveries.filter((row) => row.state === "processed")).toHaveLength(8);
       expect(deliveries.filter((row) => row.redactedError === "Slack bot reply budget exhausted")).toHaveLength(1);
     });
 

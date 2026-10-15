@@ -466,6 +466,17 @@ function Settings({
           queryClient.setQueryData(queryKeys.chatEndpoints.detail(endpointId), next);
         }}
       />}
+      {endpoint.provider === "slack" && (
+        <SettingToggle
+          label="Require an @mention for every message"
+          detail="When on, every message needs an @mention, including replies in channel threads and direct messages. When off, the agent follows active threads and allowed DMs. Slash commands still work."
+          checked={endpoint.replyMode === "mention_each_reply"}
+          pending={updateEndpoint.isPending}
+          onChange={(required) =>
+            updateEndpoint.mutate({ replyMode: required ? "mention_each_reply" : "subscribed" })
+          }
+        />
+      )}
       {endpoint.provider === "telegram" && (
         <div className="space-y-2">
           <h2 className="text-lg font-semibold">Telegram group command</h2>

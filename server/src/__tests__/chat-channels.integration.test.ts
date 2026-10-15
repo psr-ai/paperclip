@@ -22034,6 +22034,211 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await service.shutdown();
   });
 
+  describe("Slack explicit mention reply policy", () => {
+    const channelId = "C0STRICTMENTIONS";
+    const userId = "U0STRICTREQUESTER";
+
+    async function strictFixture(overrides: Parameters<typeof configuredSlackEndpoint>[1] = {}, strict = true) {
+      const fixture = await seedCompany();
+      const configured = await configuredSlackEndpoint(fixture, {
+        allowUnlinkedPeople: false,
+        fetch: fakeSlackFetch(`U0STRICT${randomUUID().replaceAll("-", "").toUpperCase()}`) as typeof globalThis.fetch,
+        ...overrides,
+      });
+      await db.update(chatEndpoints).set({ status: "active" }).where(eq(chatEndpoints.id, configured.endpoint.id));
+      await db.insert(chatEndpointResources).values({ companyId: fixture.companyId, endpointId: configured.endpoint.id, type: "channel", providerResourceId: channelId, label: "explicit-mentions", availability: "available", enabled: true });
+      const [principal] = await db.insert(chatExternalPrincipals).values({ companyId: fixture.companyId, provider: "slack", providerAccountId: "T-PAPERCLIP", externalId: userId, handle: "requester" }).returning();
+      await db.insert(chatIdentityLinks).values({ companyId: fixture.companyId, endpointId: configured.endpoint.id, principalId: principal.id, paperclipUserId: "owner-user", status: "linked", confirmedAt: new Date() });
+      if (strict) await configured.service.update(configured.endpoint.id, { replyMode: "mention_each_reply" }, "owner-user");
+      const current = await configured.service.get(configured.endpoint.id);
+      const target = `<@${current.botExternalId}>`;
+      const thread = (root = "9800.1", isDM = false) => makeThread({ channelId: isDM ? "D0STRICTMENTIONS" : channelId, id: `slack:${isDM ? "D0STRICTMENTIONS" : channelId}:${root}`, isDM, name: "explicit-mentions" });
+      const send = (id: string, text: string, options: { root?: string; isDM?: boolean; mentioned?: boolean; trigger?: ChatSdkMessageTrigger } = {}) => deliverMessage({
+        callbacks: configured.callbacks, endpointId: configured.endpoint.id,
+        thread: thread(options.root, options.isDM).thread,
+        message: makeMessage({ id, text, mentioned: options.mentioned ?? text.includes(target), userId, userName: "requester", raw: { type: "message", user: userId, text, ts: id, channel: options.isDM ? "D0STRICTMENTIONS" : channelId } }),
+        trigger: options.trigger ?? (options.isDM ? "direct_message" : text.includes(target) ? "mention" : "subscribed_message"),
+      });
+      const comments = () => db.select().from(issueComments).where(eq(issueComments.companyId, fixture.companyId));
+      const wakes = () => db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, fixture.companyId));
+      return { ...configured, fixture, principal, current, target, thread, send, comments, wakes };
+    }
+
+    it("persists the Slack policy and rejects changing other providers", async () => {
+      const f = await strictFixture({}, false);
+      expect((await f.service.get(f.endpoint.id)).replyMode).toBe("subscribed");
+      await f.service.update(f.endpoint.id, { replyMode: "mention_each_reply" }, "owner-user");
+      expect((await f.service.get(f.endpoint.id)).replyMode).toBe("mention_each_reply");
+      const [stored] = await db.select().from(chatEndpoints).where(eq(chatEndpoints.id, f.endpoint.id));
+      expect(stored.setup).toMatchObject({ replyMode: "mention_each_reply" });
+      await f.service.update(f.endpoint.id, { replyMode: "subscribed" }, "owner-user");
+      expect((await f.service.get(f.endpoint.id)).replyMode).toBe("subscribed");
+      const other = await f.service.create(f.fixture.companyId, { provider: "telegram", assignedAgentId: f.fixture.assignedAgentId }, "owner-user");
+      await expect(f.service.update(other.id, { replyMode: "mention_each_reply" }, "owner-user")).rejects.toMatchObject({ status: 422 });
+    });
+
+    it.each(["root", "thread", "dm"] as const)("requires a fresh target mention for each %s message", async (kind) => {
+      const f = await strictFixture();
+      const options = { isDM: kind === "dm" };
+      if (kind === "thread") await f.send("9800.1", `${f.target} start this task`);
+      const before = kind === "thread" ? 1 : 0;
+      await f.send("9800.2", "This is ordinary chatter", { ...options, trigger: kind === "root" ? "unaddressed_message" : undefined });
+      expect(await f.comments()).toHaveLength(before);
+      expect(await f.wakes()).toHaveLength(before);
+      expect(f.wakeup).toHaveBeenCalledTimes(before);
+      expect(f.runtime.endpoints.get(f.endpoint.id)?.posts).toEqual([]);
+      await f.send("9800.3", `${f.target} please answer this`, options);
+      expect(await f.comments()).toHaveLength(before + 1);
+      expect(await f.wakes()).toHaveLength(before + 1);
+      expect(f.wakeup.mock.calls.at(-1)?.[1].allowRunCoalescing).toBeUndefined();
+      await f.send("9800.4", "Thanks, no reply needed", options);
+      expect(await f.comments()).toHaveLength(before + 1);
+      expect(await f.wakes()).toHaveLength(before + 1);
+    });
+
+    it.each(["other_bot", "plain_name", "inline_code", "fenced_code", "quote"] as const)("does not mistake %s text for an explicit target request", async (kind) => {
+      const f = await strictFixture();
+      const text = {
+        other_bot: "<@U0SOMEBODYELSE> please reply", plain_name: "@Maya please reply",
+        inline_code: `Example: \`${f.target} reply\``, fenced_code: `\`\`\`\n${f.target} reply\n\`\`\``,
+        quote: `> ${f.target} earlier quoted message`,
+      }[kind];
+      await f.send("9800.1", text, { mentioned: true, trigger: "mention" });
+      expect(await f.comments()).toEqual([]);
+      expect(await f.wakes()).toEqual([]);
+      expect(await f.service.listConversations(f.endpoint.id)).toEqual([]);
+    });
+
+    it("retains subscribed-thread and unmentioned-DM behavior in the default mode", async () => {
+      const f = await strictFixture({}, false);
+      await f.send("9800.1", `${f.target} start here`);
+      await f.send("9800.2", "Continue on the subscribed thread");
+      await f.send("9801.1", "Please handle this direct message", { root: "9801.1", isDM: true });
+      expect(await f.comments()).toHaveLength(3);
+      expect(await f.wakes()).toHaveLength(3);
+      expect(f.wakeup.mock.calls.every(([, wake]) => wake.allowRunCoalescing === undefined)).toBe(true);
+    });
+
+    it("qualifies strict Slack setup with an explicit request and its published final", async () => {
+      const f = await strictFixture();
+      await db.update(chatEndpoints).set({ status: "verifying" }).where(eq(chatEndpoints.id, f.endpoint.id));
+      await f.send("9800.1", `${f.target} please verify this setup`);
+      const [conversation] = await f.service.listConversations(f.endpoint.id);
+      const contextSnapshot = await chatWakeContext({ endpointId: f.endpoint.id, issueId: conversation!.issueId, provider: "slack", providerMessageId: "9800.1" });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.fixture.companyId, agentId: f.fixture.assignedAgentId, responsibleUserId: "owner-user", status: "succeeded", contextSnapshot });
+      await initializeRunIdentity(db, { companyId: f.fixture.companyId, runId, issueId: conversation!.issueId, responsibleUserId: "owner-user", messageIds: [contextSnapshot.wakeCommentId], cause: "instruction" });
+      await addSelectedChatFinal({ companyId: f.fixture.companyId, issueId: conversation!.issueId, agentId: f.fixture.assignedAgentId, runId, body: "Strict mention setup succeeded" });
+      await f.service.processPendingPublications();
+      await expect(f.service.test(f.endpoint.id)).resolves.toMatchObject({ status: "active", replyMode: "mention_each_reply", setup: { step: "complete" } });
+    });
+
+    it.each([false, true])("rechecks current strict policy while recovering a queued message (explicit: %s)", async (explicit) => {
+      const f = await strictFixture({ deferWebhookProcessing: true, scheduleDeferredWork: () => undefined }, false);
+      await f.send("9800.1", explicit ? `${f.target} a queued request` : "A queued direct message", { isDM: true });
+      const [queued] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(queued).toBeDefined();
+      expect(f.wakeup).not.toHaveBeenCalled();
+      await f.service.update(f.endpoint.id, { replyMode: "mention_each_reply" }, "owner-user");
+      await f.service.shutdown();
+      await db.update(chatDeliveries).set({ nextAttemptAt: new Date(0) }).where(eq(chatDeliveries.id, queued.id));
+      const fresh = createService();
+      await fresh.service.processPendingDeliveries(1, queued.id);
+      const [recovered] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, queued.id));
+      expect(recovered.state).toBe(explicit ? "processed" : "filtered");
+      expect(await f.comments()).toHaveLength(explicit ? 1 : 0);
+      expect(await f.wakes()).toHaveLength(explicit ? 1 : 0);
+      expect(fresh.wakeup).toHaveBeenCalledTimes(explicit ? 1 : 0);
+    });
+
+    it("rechecks a newly strict policy at the atomic task mutation boundary", async () => {
+      let release!: () => void;
+      let entered!: () => void;
+      const ready = new Promise<void>((resolve) => { entered = resolve; });
+      const hold = new Promise<void>((resolve) => { release = resolve; });
+      const f = await strictFixture({ reachAuthorizationBarrier: async () => { entered(); await hold; } }, false);
+      const sending = f.send("9800.1", "An ordinary DM pending admission", { isDM: true });
+      try { await ready; await f.service.update(f.endpoint.id, { replyMode: "mention_each_reply" }, "owner-user"); }
+      finally { release(); }
+      await sending;
+      expect(await f.comments()).toEqual([]);
+      expect(await f.wakes()).toEqual([]);
+      expect(await f.service.listConversations(f.endpoint.id)).toEqual([]);
+    });
+
+    it("rechecks strict policy inside durable scheduler admission", async () => {
+      let tighten: (() => Promise<void>) | undefined;
+      const f = await strictFixture({ wakeup: async () => { await tighten?.(); return { accepted: true }; } }, false);
+      tighten = () => f.service.update(f.endpoint.id, { replyMode: "mention_each_reply" }, "owner-user").then(() => undefined);
+      await f.send("9800.1", "An ordinary DM admitted before the policy changed", { isDM: true });
+      expect(f.wakeup).toHaveBeenCalledTimes(1);
+      expect(await f.wakes()).toEqual([]);
+      const [intent] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "inbound_wakeup")));
+      expect(intent.status).toBe("failed");
+    });
+    it.each([false, true])("rechecks current mention policy before publishing a retained request (explicit: %s)", async (explicit) => {
+      const f = await strictFixture({}, false);
+      await f.send("9800.1", explicit ? `${f.target} please answer` : "Please answer this DM", { isDM: true });
+      const [conversation] = await f.service.listConversations(f.endpoint.id);
+      const contextSnapshot = await chatWakeContext({ endpointId: f.endpoint.id, issueId: conversation!.issueId, provider: "slack", providerMessageId: "9800.1" });
+      const runId = randomUUID();
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.fixture.companyId, agentId: f.fixture.assignedAgentId, responsibleUserId: "owner-user", status: "succeeded", invocationSource: "assignment", contextSnapshot });
+      await initializeRunIdentity(db, { companyId: f.fixture.companyId, runId, issueId: conversation!.issueId, responsibleUserId: "owner-user", messageIds: [contextSnapshot.wakeCommentId], cause: "instruction" });
+      const comment = await addSelectedChatFinal({ companyId: f.fixture.companyId, issueId: conversation!.issueId, agentId: f.fixture.assignedAgentId, runId, body: "A retained request answer" });
+      await f.service.update(f.endpoint.id, { replyMode: "mention_each_reply" }, "owner-user");
+      await f.service.processPendingPublications();
+      const publications = await db.select().from(chatPublications).where(eq(chatPublications.commentId, comment.id));
+      expect(publications.length).toBeGreaterThan(0);
+      expect(publications.some((row) => row.state === "published")).toBe(explicit);
+      expect(f.runtime.endpoints.get(f.endpoint.id)?.posts).toHaveLength(explicit ? 1 : 0);
+    });
+
+    it("enforces fresh mentions on signed human root, thread and DM events through the actual Slack SDK", async () => {
+      const f = await strictFixture({ deferWebhookProcessing: true, scheduleDeferredWork: () => undefined });
+      const pinned = createChatSdkEndpointRuntime({ ...f.runtime.configurations.get(f.endpoint.id)!, logger: "silent" });
+      const fake = f.runtime.endpoints.get(f.endpoint.id)!;
+      Object.assign(fake, { handleWebhook: (req: Request) => pinned.handleWebhook(req) });
+      try {
+        await pinned.initialize();
+        const adapter = pinned.getProviderAdapter() as unknown as { _client: {
+          users: { info: (args: unknown) => Promise<unknown> };
+          conversations: { info: (args: { channel: string }) => Promise<unknown>; replies: (args: unknown) => Promise<unknown> };
+          reactions: { add: (args: unknown) => Promise<unknown> };
+        } };
+        adapter._client.users.info = vi.fn(async () => ({ ok: true, user: { id: userId, name: "requester", is_bot: false, profile: { display_name: "Requester" } } }));
+        adapter._client.conversations.info = vi.fn(async ({ channel }) => ({ ok: true, channel: { id: channel, name: "explicit-mentions", is_member: true, is_im: channel.startsWith("D") } }));
+        adapter._client.conversations.replies = vi.fn(async () => ({ ok: true, messages: [], has_more: false }));
+        adapter._client.reactions.add = vi.fn(async () => ({ ok: true }));
+        const send = async (ts: string, text: string, options: { isDM?: boolean; root?: string } = {}) => {
+          const body = JSON.stringify({ type: "event_callback", team_id: "T-PAPERCLIP", event_id: `Ev-strict-${ts}`, event: { type: "message", user: userId, text, ts, channel: options.isDM ? "D0STRICTMENTIONS" : channelId, channel_type: options.isDM ? "im" : "channel", thread_ts: options.root, team: "T-PAPERCLIP" } });
+          const response = await f.service.handleWebhook(f.endpoint.publicId, "slack", signedSlackWebhookRequest({ url: `https://paperclip.example/api/chat-webhooks/${f.endpoint.publicId}/slack`, contentType: "application/json", body, signingSecret: "test-signing-secret" }));
+          expect(response.ok).toBe(true);
+          const rows = await db.select().from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, f.endpoint.id), like(chatDeliveries.providerEventId, `%:${ts}`)));
+          for (const row of rows) {
+            await db.update(chatDeliveries).set({ nextAttemptAt: new Date(0) }).where(eq(chatDeliveries.id, row.id));
+            await f.service.processPendingDeliveries(1, row.id);
+          }
+        };
+        await send("9810.1", "Ordinary channel chatter");
+        await send("9811.1", "An unmentioned direct message", { isDM: true });
+        await send("9812.1", "<@U0SOMEBODYELSE> another bot request");
+        await send("9813.1", `Example: \`${f.target} reply\``);
+        await send("9814.1", `> ${f.target} quoted earlier request`);
+        expect(await f.comments()).toEqual([]);
+        expect(await f.wakes()).toEqual([]);
+        await send("9820.1", `${f.target} start this task`);
+        expect(await f.wakes()).toHaveLength(1);
+        await send("9820.2", "An unmentioned reply", { root: "9820.1" });
+        expect(await f.comments()).toHaveLength(1);
+        expect(await f.wakes()).toHaveLength(1);
+        await send("9820.3", `${f.target} explicit followup`, { root: "9820.1" });
+        await send("9821.1", `${f.target} explicit direct message`, { isDM: true });
+        expect(await f.comments()).toHaveLength(3);
+        expect(await f.wakes()).toHaveLength(3);
+      } finally { await pinned.shutdown(); }
+    });
+  });
+
   describe("governed Slack bot mentions", () => {
     const senderId = "U0BOTREQUESTER";
     const channelId = "C0BOTREQUESTS";
@@ -22108,6 +22313,22 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       });
       return { ...configured, fixture, current, message, resource: resource!, send, thread };
     }
+
+    it("preserves bot allowlist and reply budgets under mention-each-reply mode", async () => {
+      const f = await botFixture();
+      await f.service.update(f.endpoint.id, { replyMode: "mention_each_reply" }, "owner-user");
+      await f.send("9900.1");
+      await f.send("9900.2", { mentioned: false });
+      await f.send("9900.3", { userId: "U0UNGRANTEDBOT" });
+      expect(f.wakeup).toHaveBeenCalledTimes(1);
+      await f.send("9900.4");
+      await f.send("9900.5");
+      await f.send("9900.6");
+      expect(f.wakeup).toHaveBeenCalledTimes(3);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.fixture.companyId))).toHaveLength(3);
+      const deliveries = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(deliveries.some((row) => row.redactedError === "Slack bot reply budget exhausted")).toBe(true);
+    });
 
     it("accepts an explicitly granted machine without impersonation or forcing guest-only runtime isolation", async () => {
       const f = await botFixture();
@@ -71355,8 +71576,11 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
         const rows = await orderedBatch(comment!.id);
         expect(rows.length).toBeGreaterThan(1);
         expect(rows.every((row) => row.state === "published")).toBe(true);
+        // Unknown bare IDs remain readable without inventing notifications;
+        // the neutralizing character also expands this response over the cap.
+        expect(comment!.body).toBe(summary);
         expect(rows.map((row) => row.payload.text).join("")).toBe(
-          summary.trim(),
+          summary.replaceAll("@U12345678", "@\u200bU12345678").trim(),
         );
         expect(
           rows.every((row) =>

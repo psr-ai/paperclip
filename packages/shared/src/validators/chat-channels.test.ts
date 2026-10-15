@@ -8,6 +8,16 @@ import {
   updateChatEndpointSchema,
 } from "./chat-channels.js";
 
+describe("Slack explicit mention reply policy validation", () => {
+  it.each(["subscribed", "mention_each_reply"] as const)("accepts the closed reply mode %s", (replyMode) => {
+    expect(updateChatEndpointSchema.parse({ replyMode })).toEqual({ replyMode });
+  });
+
+  it.each(["always", "mentions", "", null, true, { mode: "mention_each_reply" }])("rejects an unsupported reply mode %#", (replyMode) => {
+    expect(updateChatEndpointSchema.safeParse({ replyMode }).success).toBe(false);
+  });
+});
+
 describe("Slack bot message policy validation", () => {
   it("accepts exact bot/channel grants and an empty list to revoke them", () => {
     const slackBotMessages = { allowlist: [{ botUserId: "U0BOTREQUESTER", channelId: "C0BOTREQUESTS" }] };

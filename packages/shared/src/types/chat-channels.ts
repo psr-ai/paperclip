@@ -192,6 +192,7 @@ export interface SlackBotMessagePolicy {
 }
 
 export interface ChatEndpointSetupState {
+  replyMode?: "subscribed" | "mention_each_reply";
   slackBotMessages?: SlackBotMessagePolicy;
   github?: {
     stage: "connect" | "install" | "repositories" | "verify" | "identity" | "behavior" | "test";
@@ -254,7 +255,7 @@ export interface ChatEndpoint {
   allowDirectMessages: boolean;
   allowGroupChats: boolean;
   allowUnlinkedPeople: boolean;
-  replyMode: "subscribed";
+  replyMode: "subscribed" | "mention_each_reply";
   capabilities: ChatAdapterCapabilities;
   setup: ChatEndpointSetupState;
   healthMessage?: string | null;
@@ -487,6 +488,8 @@ export interface CreateChatEndpointInput {
 }
 
 export interface UpdateChatEndpointInput {
+  /** Slack ordinary messages, including existing threads and direct messages. */
+  replyMode?: "subscribed" | "mention_each_reply";
   /** Explicit machine senders; independent of human identity linking. */
   slackBotMessages?: SlackBotMessagePolicy;
   slackApp?: SlackAppConfiguration;

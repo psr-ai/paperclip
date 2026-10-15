@@ -1098,6 +1098,26 @@ describe("durable inbound chat scheduler receipts", () => {
     ).toEqual([]);
   });
 
+  it.each([false, true])("rejects newly unauthorized chat before reusing existing work (deferred: %s)", async (deferred) => {
+    const f = await fixture(deferred);
+    const first = f.request();
+    await f.wake(first);
+    if (!deferred) {
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, first.id));
+      await db.update(issues).set({ executionRunId: receipt.runId, executionAgentNameKey: "maya", executionLockedAt: new Date() }).where(eq(issues.id, f.issueId));
+    }
+    const snapshot = async () => ({
+      receipts: await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, f.agentId)).orderBy(agentWakeupRequests.id),
+      runs: await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, f.agentId)).orderBy(heartbeatRuns.id),
+      issue: await db.select().from(issues).where(eq(issues.id, f.issueId)),
+    });
+    const before = await snapshot();
+    f.authorize.mockRejectedValueOnce(new Error("The current Slack policy requires an explicit mention"));
+    await expect(f.wake(f.request())).rejects.toThrow("requires an explicit mention");
+    expect(await snapshot()).toEqual(before);
+    expect(f.authorize).toHaveBeenCalledTimes(2);
+  });
+
   it.each([
     { provider: "slack", state: "active", callerMarkers: false },
     { provider: "telegram", state: "completed", callerMarkers: false },

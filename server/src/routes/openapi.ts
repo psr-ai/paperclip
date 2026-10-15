@@ -787,6 +787,7 @@ const chatAdapterCapabilitiesResponseSchema = z
 
 const chatEndpointSetupResponseSchema = z
   .object({
+    replyMode: z.enum(["subscribed", "mention_each_reply"]).optional(),
     step: z.enum(["choose_agent", "provider_setup", "test", "complete"]),
     testStartedAt: z.string().datetime().nullable().optional(),
     authorizationUrl: z.string().nullable().optional(),
@@ -845,7 +846,7 @@ const chatEndpointResponseSchema = z
     allowDirectMessages: z.boolean(),
     allowGroupChats: z.boolean(),
     allowUnlinkedPeople: z.boolean(),
-    replyMode: z.literal("subscribed"),
+    replyMode: z.enum(["subscribed", "mention_each_reply"]),
     capabilities: chatAdapterCapabilitiesResponseSchema,
     setup: chatEndpointSetupResponseSchema,
     healthMessage: z.string().nullable(),

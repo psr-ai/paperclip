@@ -1,5 +1,33 @@
 # Authorized Slack bot mentions
 
+## Mention-only replies
+
+In Apps → the Slack connection → Settings, enable **Require an @mention for
+every message** to select `mention_each_reply`. The same authenticated endpoint
+API accepts:
+
+```json
+{ "replyMode": "mention_each_reply" }
+```
+
+Every ordinary Slack message must then explicitly mention that connection's bot,
+including replies in existing task threads and direct messages. A plain display
+name, another bot's mention, or a mention inside code or quoted text does not
+start work. The setting is enforced before task comments and agent wakeups, and
+rechecked for retained work and replies when the setting changes. Old ignored
+messages are not replayed. Existing warm human sessions and their scheduling
+behavior are retained.
+
+`subscribed` is the backward-compatible default: an initial mention starts a
+channel task, subsequent thread replies may continue it without another mention,
+and enabled DMs may start or continue work. The setting applies only to Slack;
+channel access, human identity checks, bot allowlists, and bot reply budgets
+continue to apply independently. Deliberate slash commands, buttons, and other
+authenticated control actions remain explicit invocations and do not require an
+extra mention. It does not cancel an already executing model request.
+
+## Authorizing other bots
+
 Slack endpoints ignore other bots by default. An endpoint administrator can
 authorize a specific Slack bot user in a specific channel to request a turn from
 the assigned agent. This is a machine grant sponsored by the endpoint's active

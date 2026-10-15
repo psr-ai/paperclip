@@ -1,4 +1,5 @@
 import { explicitSlackBotMention, isSlackBotEvent, rememberRecoveredSlackBotMention, slackBotMessageAllowed, SLACK_BOT_BUDGET_EXHAUSTED, SLACK_BOT_ENDPOINT_MINUTE_LIMIT, SLACK_BOT_MESSAGE_DENIED, SLACK_BOT_THREAD_TURN_LIMIT } from "./slack-bot-messages.js";
+import { explicitSlackMessageMention, isSlackSlashControlDelivery, rememberRecoveredSlackExplicitMention, slackMessageReplyAllowed, slackReplyMode, SLACK_EXPLICIT_MENTION_REQUIRED } from "./slack-reply-policy.js";
 import { withSlackBoardLease } from "./slack-board-lease.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { authorizeSlackBoardPublication } from "./slack-board-authority.js";
@@ -2711,6 +2712,7 @@ function providerSetupState(
         ),
         slackApp: endpoint.setup.slackApp,
         slackBotMessages: endpoint.setup.slackBotMessages,
+        replyMode: slackReplyMode(endpoint),
         // Slack registers the slash command in the provider configuration.
         // Keep that identity immutable when the assigned agent is renamed;
         // deriving it remains only a compatibility path for older rows.
@@ -3785,6 +3787,21 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         return;
       }
       reactionProvider = record.endpoint.provider;
+      if (slackReplyMode(record.endpoint) === "mention_each_reply" && payload.operation === "add") {
+        const [source] = action.deliveryId ? await db.select().from(chatDeliveries).where(and(
+          eq(chatDeliveries.id, action.deliveryId), eq(chatDeliveries.companyId, action.companyId),
+          eq(chatDeliveries.endpointId, action.endpointId),
+        )) : [];
+        if (!source || (["message", "mention", "direct_message"].includes(source.eventKind) &&
+          !slackMessageReplyAllowed(record.endpoint, source.normalizedEvent))) {
+          await credentialLease.assertOwned();
+          await db.update(chatActions).set({ status: "cancelled", result: {
+            attempts: attempt, code: "receipt_reaction_source_no_longer_authorized",
+          }, updatedAt: new Date() }).where(and(eq(chatActions.id, action.id), eq(chatActions.status, "processing"),
+            sql`(${chatActions.result}->>'attempts')::int = ${attempt}`));
+          return;
+        }
+      }
       // Resolve the adapter only after acquiring the credential lease and
       // proving the action's durable generation/fingerprint is still current.
       // Never reuse the live callback's adapter: it may hold an installation
@@ -5089,6 +5106,14 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     const destinationAllowed = isDirectMessage
       ? endpoint.allowDirectMessages
       : nonDirectDestinationAllowed(endpoint, resource);
+    if (slackReplyMode(endpoint) === "mention_each_reply" && action.deliveryId) {
+      const [source] = await tx.select().from(chatDeliveries).where(and(
+        eq(chatDeliveries.id, action.deliveryId), eq(chatDeliveries.companyId, endpoint.companyId),
+        eq(chatDeliveries.endpointId, endpoint.id),
+      ));
+      if (!source || (["message", "mention", "direct_message"].includes(source.eventKind) &&
+        !slackMessageReplyAllowed(endpoint, source.normalizedEvent))) return false;
+    }
     if (payload.authorizationMode === "safe_notice") return true;
     if (!destinationAllowed) return false;
     if (!action.principalId) return false;
@@ -5877,7 +5902,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       allowDirectMessages: endpoint.allowDirectMessages,
       allowGroupChats: endpoint.allowGroupChats,
       allowUnlinkedPeople: endpoint.allowUnlinkedPeople,
-      replyMode: "subscribed",
+      replyMode: slackReplyMode(endpoint),
       capabilities: endpoint.capabilities,
       setup: {
         ...providerSetupState(
@@ -6125,6 +6150,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             throw unprocessable("The connected Slack bot cannot authorize its own messages");
           }
           values.setup = { ...(values.setup ?? existing.endpoint.setup), slackBotMessages: input.slackBotMessages };
+        }
+        if (input.replyMode !== undefined) {
+          if (existing.endpoint.provider !== "slack") throw unprocessable("Reply mode only applies to Slack connections");
+          values.setup = { ...(values.setup ?? existing.endpoint.setup), replyMode: input.replyMode };
         }
         if (input.allowDirectMessages !== undefined)
           values.allowDirectMessages = input.allowDirectMessages;
@@ -10097,7 +10126,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 eq(chatDeliveries.endpointId, endpoint.id),
                 eq(chatDeliveries.state, "processed"),
                 gte(chatDeliveries.processedAt, testStartedAt),
-                sql`${chatDeliveries.normalizedEvent}->>'trigger' = ${requiredTrigger}`,
+                slackReplyMode(endpoint) === "mention_each_reply"
+                  ? sql`${chatDeliveries.normalizedEvent}->'message'->>'slackExplicitMention' = 'true'`
+                  : sql`${chatDeliveries.normalizedEvent}->>'trigger' = ${requiredTrigger}`,
               ),
             )
             .orderBy(desc(chatDeliveries.processedAt))
@@ -10108,7 +10139,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             !qualifyingDelivery.processedAt
           ) {
             throw conflict(
-              ["telegram", "imessage-photon"].includes(endpoint.provider)
+              slackReplyMode(endpoint) === "mention_each_reply"
+                ? "Send a message explicitly mentioning the agent before completing setup"
+                : ["telegram", "imessage-photon"].includes(endpoint.provider)
                 ? "Send the test direct message before completing setup"
                 : "Reply once without mentioning the agent before completing setup",
               { code: "chat_test_follow_up_missing" },
@@ -10379,6 +10412,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     userId: string | null;
     sponsorUserId?: string | null;
   }> {
+    if (botMessageContext && !slackMessageReplyAllowed(endpoint, botMessageContext)) {
+      return { allowed: false, linkedDenied: false, userId: null };
+    }
     const githubAccess = await githubChatPrincipalAccess(tx, endpoint, principalId);
     if (githubAccess) return githubAccess;
     // Link confirmation already uses this transaction-scoped identity key.
@@ -13725,6 +13761,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         or(commentIds.length ? inArray(sql<string>`${chatActions.payload}->>'commentId'`, commentIds) : undefined,
           wakeIds.length ? inArray(chatActions.id, wakeIds) : undefined)));
     for (const source of sources) {
+      if (!slackMessageReplyAllowed(endpoint, source.delivery.normalizedEvent)) return false;
       if (!source.principal.isBot && !isSlackBotEvent(source.delivery.normalizedEvent)) continue;
       if (run && responsibleUserId !== endpoint.sponsorUserId) return false;
       const authorization = await lockCurrentPrincipalAuthorization(tx, endpoint, source.principal.id, source.delivery.normalizedEvent);
@@ -14636,6 +14673,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       endpoint.provider === "imessage-photon" ||
       trigger === "mention" ||
       trigger === "direct_message" ||
+      (slackReplyMode(endpoint) === "mention_each_reply" && explicitSlackMessageMention(message, endpoint.botExternalId)) ||
       message.isMention === true;
     const eventKind: ChatEventKind =
       trigger === "direct_message"
@@ -14818,6 +14856,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           endpoint.provider === "telegram" ? (providerUpdateId ?? null) : null,
         text: message.text.slice(0, MAX_INBOUND_TEXT),
         mentionedBot: message.isMention === true,
+        ...(endpoint.provider === "slack"
+          ? { slackExplicitMention: explicitSlackMessageMention(message, endpoint.botExternalId) } : {}),
         ...(endpoint.provider === "slack" && message.author.isBot === true
           ? { slackBotMentioned: explicitSlackBotMention(message, endpoint.botExternalId) } : {}),
         providerSentAt: providerSentAt?.toISOString() ?? null,
@@ -15721,7 +15761,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const principalAllowed =
         !principalResolution.linkedDenied &&
         (slackBot ? botAllowed : principalResolution.userId !== null || guestSponsorAllowed);
-      const activationAllowed = slackBot ? botAllowed : addressed || existingConversation !== null;
+      const mentionAllowed = slackMessageReplyAllowed(endpoint, normalized);
+      const activationAllowed = mentionAllowed && (slackBot ? botAllowed : addressed || existingConversation !== null);
       const allowed =
         endpointAllowed &&
         destinationAllowed &&
@@ -15759,6 +15800,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         !addressed &&
         existingConversation === null &&
         activeDelivery.attempts <= ORPHAN_FOLLOW_UP_MAX_ATTEMPTS &&
+        mentionAllowed &&
         endpointAllowed &&
         principalAllowed &&
         (destinationAllowed || setupDestinationCanBeEnabledByEarlierMention)
@@ -15796,7 +15838,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 ? slackBot ? SLACK_BOT_MESSAGE_DENIED : endpoint.allowUnlinkedPeople
                   ? "Endpoint sponsor can no longer authorize external guests"
                   : "External identity must be linked to a Paperclip account"
-                : "Message did not address the agent or an active task thread";
+                : !mentionAllowed ? SLACK_EXPLICIT_MENTION_REQUIRED : "Message did not address the agent or an active task thread";
         await db
           .update(chatDeliveries)
           .set({
@@ -15883,7 +15925,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
       const emptySlackMention =
         endpoint.provider === "slack" &&
-        (trigger === "mention" || message.isMention === true || (slackBot && normalized.message.slackBotMentioned === true)) &&
+        (trigger === "mention" || message.isMention === true || (slackBot && normalized.message.slackBotMentioned === true) ||
+          (slackReplyMode(endpoint) === "mention_each_reply" && normalized.message.slackExplicitMention === true)) &&
         message.attachments.length === 0 &&
         !hasMeaningfulSlackMentionRequest(message.text);
       if (emptySlackMention && slackBot) {
@@ -16545,7 +16588,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               processedAt: filteredAt,
               redactedError: endpointStillAllowed
                 ? destinationStillAllowed
-                  ? currentPrincipalAuthorization.linkedDenied
+                  ? !slackMessageReplyAllowed(currentEndpoint, normalized)
+                    ? SLACK_EXPLICIT_MENTION_REQUIRED
+                    : currentPrincipalAuthorization.linkedDenied
                     ? "Linked Paperclip account is not currently permitted"
                     : slackBot ? SLACK_BOT_MESSAGE_DENIED : currentEndpoint.allowUnlinkedPeople
                       ? "Endpoint sponsor can no longer authorize external guests"
@@ -17234,6 +17279,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         text?: unknown;
         mentionedBot?: unknown;
         slackBotMentioned?: unknown;
+        slackExplicitMention?: unknown;
         attachments?: Array<{
           name?: unknown;
           mimeType?: unknown;
@@ -17358,6 +17404,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     } as unknown as Message;
     if (endpointRuntime.provider === "slack" && normalized.principal?.isBot === true && normalized.message?.slackBotMentioned === true) {
       rememberRecoveredSlackBotMention(message);
+    }
+    if (endpointRuntime.provider === "slack" && normalized.message?.slackExplicitMention === true) {
+      rememberRecoveredSlackExplicitMention(message);
     }
     const githubManual = delivery.normalizedEvent.githubManual;
     if (endpointRuntime.provider === "github" && githubManual && typeof githubManual === "object") githubManualMessages.set(message, githubManual as { policy: GitHubReviewPolicy; revision: number; event: "mention" | "comment" });
@@ -17598,6 +17647,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               undefined,
               false,
               setupDestinationActivationSuppressed(delivery.normalizedEvent),
+              isSlackSlashControlDelivery(delivery.normalizedEvent),
             );
           } else {
             if (deliveryContentWasRedacted(delivery.normalizedEvent)) {
@@ -17666,6 +17716,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
               undefined,
               false,
               reconstructed.suppressSetupDestinationActivation,
+              isSlackSlashControlDelivery(delivery.normalizedEvent),
             );
           }
         } catch (error) {

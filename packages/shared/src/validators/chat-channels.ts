@@ -84,6 +84,7 @@ export const slackAppConfigurationSchema = z.object({
 
 export const updateChatEndpointSchema = z
   .object({
+    replyMode: z.enum(["subscribed", "mention_each_reply"]).optional(),
     slackBotMessages: z.object({
       allowlist: z.array(z.object({
         botUserId: z.string().regex(/^[UW][A-Z0-9]{2,63}$/),

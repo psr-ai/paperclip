@@ -54,5 +54,16 @@ publication boundaries. Removing the grant prevents queued work from gaining
 authority from a stale receipt. Previously ignored messages are not automatically
 replayed when the grant is added; send a fresh explicit mention after enabling it.
 
+Replies retain the sender's immutable Slack user ID in the task's `Reply mention`
+metadata. Use that exact `<@USER_ID>` syntax when a reply should notify the sender.
+Before delivery, Paperclip also resolves existing bare references such as
+`@hi-dot` to a unique known participant of that same company, Slack endpoint,
+workspace, and conversation. Only processed inbound participants are eligible;
+no workspace-wide name guessing or automatic mention insertion occurs.
+Ambiguous and unknown bare names remain plain text. The resolved publication is
+saved before message splitting and retries, so posting, editing, and streaming
+use the same ID even if a display name later changes. Code, links, URLs, and email
+addresses are not rewritten by this resolution step.
+
 For Slack event identity details, see the official
 [bot message event documentation](https://docs.slack.dev/reference/events/message/bot_message/).

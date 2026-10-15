@@ -7,6 +7,9 @@ import {
   type Db,
 } from "@paperclipai/db";
 import { object } from "./slack-client.js";
+import { projectSafeChatPublicationText } from "../chat-publication-projection.js";
+import { resolveSlackPublicationMentions } from "../slack-publication-mentions.js";
+import { loadSlackPublicationParticipants } from "../slack-publication-participants.js";
 
 /** Explicit sends use a separate durable receipt. Suppress an identical automatic
  * final, but retain distinct summaries, questions, blockers and progress. */
@@ -24,6 +27,7 @@ export async function slackExplicitPublicationDuplicate(
   const [comment] = await db
     .select({
       runId: sql<string>`coalesce(${issueComments.createdByRunId}, ${issueComments.derivedCreatedByRunId})`,
+      body: issueComments.body,
     })
     .from(issueComments)
     .where(
@@ -63,6 +67,13 @@ export async function slackExplicitPublicationDuplicate(
         sql`${chatActions.payload}->>'name' = 'slack_post_message'`,
       ),
     );
+  const sourceText = projectSafeChatPublicationText(comment.body).trim();
+  const publicationText = publication.payload.text.trim();
+  // A changed durable payload must still be exactly the normalized original
+  // comment. Sharing a comment ID alone cannot suppress a distinct summary.
+  const normalizedSourceMatches = sends.some(({ payload }) => String(object(payload.args).text).trim() === sourceText)
+    && !publication.payload.transportPart
+    && resolveSlackPublicationMentions(sourceText, await loadSlackPublicationParticipants(db, publication)) === publicationText;
   const match = sends.find(({ payload }) => {
     const args = object(payload.args);
     const thread = conversation.externalThreadId.split(":").at(-1);
@@ -70,7 +81,10 @@ export async function slackExplicitPublicationDuplicate(
       args.channel ===
         conversation.externalConversationId.replace(/^slack:/, "") &&
       args.thread_ts === thread &&
-      String(args.text).trim() === publication.payload.text.trim()
+      (
+        String(args.text).trim() === publicationText ||
+        (normalizedSourceMatches && String(args.text).trim() === sourceText)
+      )
     );
   });
   return match

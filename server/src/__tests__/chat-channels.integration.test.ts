@@ -4417,6 +4417,13 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
     await db.update(chatActions).set({ status: "uncertain" }).where(eq(chatActions.id, explicitSend.id));
     await expect(slackExplicitPublicationDuplicate(db, publication)).resolves.toBe("unresolved");
     await db.update(chatActions).set({ status: "processed" }).where(eq(chatActions.id, explicitSend.id));
+    const mentionedSend = { ...send, text: "Recorded the decision, @hi-dot.", idempotencyKey: randomUUID() };
+    await executeConnectorTool(db, binding, "slack_post_message", mentionedSend);
+    const [mentionedComment] = await db.insert(issueComments).values({ companyId: binding.companyId, issueId: binding.issueId, authorAgentId: binding.agentId, createdByRunId: runId, body: mentionedSend.text }).returning();
+    await db.update(chatExternalPrincipals).set({ handle: "hi-dot", displayName: "Hi Dot" }).where(eq(chatExternalPrincipals.id, principal.id));
+    const canonicalPublication = { ...publication, commentId: mentionedComment.id, payload: { text: "Recorded the decision, <@UTOOLS>." } };
+    await expect(slackExplicitPublicationDuplicate(db, canonicalPublication)).resolves.toBe("delivered");
+    await expect(slackExplicitPublicationDuplicate(db, { ...canonicalPublication, payload: { text: "A distinct outcome summary" } })).resolves.toBeNull();
     await expect(executeConnectorTool(db, binding, "slack_post_message", { ...send, text: "Different operation" })).rejects.toThrow("different Slack operation");
     // Definite rate-limit failures can retry after their deadline; uncertain
     // deliveries are reconciled without sending another message.
@@ -22323,6 +22330,109 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       const publications = await db.select().from(chatPublications).where(and(eq(chatPublications.endpointId, f.endpoint.id), eq(chatPublications.commentId, finalComment.id)));
       expect(publications.length).toBeGreaterThan(0);
       expect(publications.some((publication) => publication.state === "published")).toBe(!revoked);
+    });
+
+    async function selectedBotFinal(f: Awaited<ReturnType<typeof botFixture>>, body: string) {
+      const conversation = (await f.service.listConversations(f.endpoint.id)).find((row) => row.externalThreadId === f.thread().thread.id)!;
+      expect(conversation).toBeDefined();
+      const runId = randomUUID();
+      const contextSnapshot = await chatWakeContext({ endpointId: f.endpoint.id, issueId: conversation.issueId, provider: "slack", providerMessageId: "9900.1" });
+      await db.insert(heartbeatRuns).values({ id: runId, companyId: f.fixture.companyId, agentId: f.fixture.assignedAgentId, responsibleUserId: "owner-user", status: "succeeded", invocationSource: "assignment", contextSnapshot });
+      await initializeRunIdentity(db, { companyId: f.fixture.companyId, runId, issueId: conversation.issueId, responsibleUserId: "owner-user", messageIds: [contextSnapshot.wakeCommentId], cause: "instruction" });
+      const comment = await addSelectedChatFinal({ companyId: f.fixture.companyId, issueId: conversation.issueId, agentId: f.fixture.assignedAgentId, runId, body });
+      return { comment, conversation, runId };
+    }
+
+    it("resolves Slack publication aliases only from admitted participants in this company, endpoint and conversation", async () => {
+      const f = await botFixture({ allowUnlinkedPeople: true });
+      await f.send("9900.1");
+      const outsider = async (
+        context: Pick<typeof f, "callbacks" | "endpoint">,
+        id: string,
+        userId: string,
+        userName: string,
+      ) => deliverMessage({
+        callbacks: context.callbacks, endpointId: context.endpoint.id, trigger: "mention",
+        thread: makeThread({ channelId, id: `slack:${channelId}:${id}`, name: "separate-conversation" }).thread,
+        message: makeMessage({ id, text: "@maya separate authorized request", mentioned: true, userId, userName }),
+      });
+      await outsider(f, "9950.1", "U0CONVERSATION", "conversation-only");
+      const separateEndpoint = await configuredSlackEndpoint(f.fixture, { allowUnlinkedPeople: true });
+      await outsider(separateEndpoint, "9960.1", "U0ENDPOINT", "endpoint-only");
+      const otherCompany = await seedCompany();
+      const separateCompany = await configuredSlackEndpoint(otherCompany, { allowUnlinkedPeople: true });
+      await outsider(separateCompany, "9970.1", "U0COMPANY", "company-only");
+      for (const [companyId, handle] of [[f.fixture.companyId, "conversation-only"], [f.fixture.companyId, "endpoint-only"], [otherCompany.companyId, "company-only"]]) {
+        expect(await db.select().from(chatExternalPrincipals).where(and(eq(chatExternalPrincipals.companyId, companyId!), eq(chatExternalPrincipals.handle, handle!)))).toHaveLength(1);
+      }
+      const original = "Thanks @hi-dot. Ask @conversation-only, @endpoint-only and @company-only.";
+      const expected = `Thanks <@${senderId}>. Ask @\u200bconversation-only, @\u200bendpoint-only and @\u200bcompany-only.`;
+      const final = await selectedBotFinal(f, original);
+      await f.service.processPendingPublications();
+      const [publication] = await db.select().from(chatPublications).where(eq(chatPublications.commentId, final.comment.id));
+      expect(publication).toMatchObject({ state: "published", payload: { text: expected } });
+      expect(f.runtime.endpoints.get(f.endpoint.id)?.posts).toContainEqual(expect.objectContaining({ text: expected }));
+      const [savedComment] = await db.select().from(issueComments).where(eq(issueComments.id, final.comment.id));
+      expect(savedComment.body).toBe(original);
+    });
+
+    it("does not guess an ambiguous Slack participant alias during publication", async () => {
+      const f = await botFixture();
+      await f.service.update(f.endpoint.id, { slackBotMessages: { allowlist: [{ botUserId: senderId, channelId }, { botUserId: "U0SECONDREQUESTER", channelId }] } }, "owner-user");
+      await f.send("9900.1");
+      await f.send("9900.2", { userId: "U0SECONDREQUESTER" });
+      const final = await selectedBotFinal(f, "Thanks @hi-dot.");
+      await f.service.processPendingPublications();
+      const [publication] = await db.select().from(chatPublications).where(eq(chatPublications.commentId, final.comment.id));
+      expect(publication).toMatchObject({ state: "published", payload: { text: "Thanks @\u200bhi-dot." } });
+      expect(f.runtime.endpoints.get(f.endpoint.id)?.posts).toContainEqual(expect.objectContaining({ text: "Thanks @\u200bhi-dot." }));
+    });
+
+    it("excludes Slack participant identities from a different provider account", async () => {
+      const f = await botFixture();
+      const differentAccountId = "U0OTHERACCOUNT";
+      await f.service.update(f.endpoint.id, { slackBotMessages: { allowlist: [{ botUserId: senderId, channelId }, { botUserId: differentAccountId, channelId }] } }, "owner-user");
+      await f.send("9900.1");
+      await f.send("9900.2", { userId: differentAccountId });
+      // Retained/malformed cross-workspace history must not turn an unrelated
+      // principal into a valid mention target for this connected Slack account.
+      await db.update(chatExternalPrincipals).set({ providerAccountId: "T0OTHERACCOUNT", handle: "account-only", displayName: "account-only" }).where(and(eq(chatExternalPrincipals.companyId, f.fixture.companyId), eq(chatExternalPrincipals.externalId, differentAccountId)));
+      const final = await selectedBotFinal(f, "Thanks @hi-dot; ask @account-only.");
+      await f.service.processPendingPublications();
+      const [publication] = await db.select().from(chatPublications).where(eq(chatPublications.commentId, final.comment.id));
+      expect(publication).toMatchObject({ state: "published", payload: { text: `Thanks <@${senderId}>; ask @\u200baccount-only.` } });
+    });
+
+    it("retains resolved Slack publication text across a rate-limit retry and participant rename", async () => {
+      const f = await botFixture();
+      await f.send("9900.1");
+      const transport = f.runtime.endpoints.get(f.endpoint.id)!;
+      transport.postError = Object.assign(new Error("Synthetic Slack rate limit"), { name: "RateLimitError", retryAfter: 60 });
+      const final = await selectedBotFinal(f, "Thanks @hi-dot; @unlisted stays unlinked.");
+      await f.service.processPendingPublications();
+      const [pending] = await db.select().from(chatPublications).where(eq(chatPublications.commentId, final.comment.id));
+      const expected = `Thanks <@${senderId}>; @\u200bunlisted stays unlinked.`;
+      expect(pending).toMatchObject({ state: "retry", payload: { text: expected } });
+      expect(transport.posts).toEqual([]);
+      await db.update(chatExternalPrincipals).set({ handle: "unlisted", displayName: "Changed display name" }).where(and(eq(chatExternalPrincipals.companyId, f.fixture.companyId), eq(chatExternalPrincipals.externalId, senderId)));
+      transport.postError = null;
+      await db.update(chatPublications).set({ nextAttemptAt: new Date(0) }).where(eq(chatPublications.id, pending.id));
+      await f.service.processPendingPublications();
+      const [published] = await db.select().from(chatPublications).where(eq(chatPublications.id, pending.id));
+      expect(published).toMatchObject({ state: "published", attempts: 2, payload: { text: expected } });
+      expect(transport.posts).toEqual([expect.objectContaining({ text: expected })]);
+    });
+
+    it("resolves Slack publication mentions before durable size splitting", async () => {
+      const f = await botFixture();
+      await f.send("9900.1");
+      const final = await selectedBotFinal(f, "@hi-dot ".repeat(1000));
+      await f.service.processPendingPublications();
+      const publications = await db.select().from(chatPublications).where(eq(chatPublications.commentId, final.comment.id)).orderBy(asc(sql`${chatPublications.payload}->'transportPart'->>'orderKey'`));
+      expect(publications.length).toBeGreaterThan(1);
+      expect(publications.every((publication) => publication.state === "published")).toBe(true);
+      expect(publications.map((publication) => publication.payload.text).join("")).toBe(`<@${senderId}> `.repeat(1000).trim());
+      for (const publication of publications) expect(nativePublicationTextFits("slack", renderPublicationTransportText(publication.payload))).toBe(true);
     });
 
     it("admits a signed bot mention through the actual Slack SDK and deduplicates retry events", async () => {

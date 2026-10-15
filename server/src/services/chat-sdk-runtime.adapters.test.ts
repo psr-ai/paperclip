@@ -7,6 +7,7 @@ import {
 } from "./chat-sdk-runtime.js";
 import type { ChatSdkRuntimeCallbacks } from "./chat-sdk-runtime.js";
 import { splitTelegramPublicationText } from "./chat-publication-stream.js";
+import { resolveSlackPublicationMentions } from "./slack-publication-mentions.js";
 import type {
   ChatSdkStatePersistence,
   ChatSdkStateRecord,
@@ -1164,6 +1165,56 @@ describe("Chat SDK published adapter integration", () => {
     } finally {
       await runtime.shutdown();
     }
+  });
+
+  it("preserves canonical Slack publication mentions through real post, edit and native-stream serialization", async () => {
+    const runtime = createChatSdkEndpointRuntime({
+      callbacks: { onMessage() {} },
+      companyId: "company-slack-mentions",
+      endpointId: "endpoint-slack-mentions",
+      logger: "silent",
+      persistence: memoryPersistence(),
+      providerConfig: {
+        provider: "slack", userName: "paperclip-agent",
+        credentials: { botToken: "xoxb-test", botUserId: "U0PAPERCLIP", signingSecret: "synthetic-signing-secret" },
+      },
+    });
+    const source = "Thanks @hi-dot.\n\nFollow up with @unlisted; example `@hi-dot`.";
+    const resolved = resolveSlackPublicationMentions(source, [{ externalId: "U0C9FSX8K5F", handle: "hi-dot" }]);
+    expect(resolved).toBe("Thanks <@U0C9FSX8K5F>.\n\nFollow up with @\u200bunlisted; example `@hi-dot`.");
+    const postMessage = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, channel: "C0MENTIONS", ts: "1788.901" }));
+    const update = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, channel: "C0MENTIONS", ts: "1788.901" }));
+    const nativeAppend = vi.fn(async (_args: Record<string, unknown>) => ({ ok: true, channel: "C0MENTIONS", ts: "1788.903" }));
+    const nativeStop = vi.fn(async (_args?: Record<string, unknown>) => ({ ok: true, channel: "C0MENTIONS", ts: "1788.903" }));
+    const chatStream = vi.fn((_options: unknown) => ({ append: nativeAppend, stop: nativeStop }));
+    const usersList = vi.fn(async () => { throw new Error("Mention publication must not search the Slack directory"); });
+    try {
+      await runtime.initialize();
+      const adapter = runtime.getProviderAdapter() as unknown as {
+        _client: { chat: { postMessage: typeof postMessage; update: typeof update }; chatStream: typeof chatStream; users: { list: typeof usersList } };
+        postMessage(threadId: string, message: { markdown: string }): Promise<{ id: string }>;
+        editMessage(threadId: string, messageId: string, message: { markdown: string }): Promise<{ id: string }>;
+        endTyping(threadId: string): Promise<void>;
+        stream(threadId: string, chunks: AsyncIterable<string>, options: { recipientTeamId: string; recipientUserId: string; updateIntervalMs: number }): Promise<{ id: string } | null>;
+      };
+      adapter._client.chat.postMessage = postMessage;
+      adapter._client.chat.update = update;
+      adapter._client.chatStream = chatStream;
+      adapter._client.users.list = usersList;
+      adapter.endTyping = vi.fn(async () => undefined);
+      const threadId = "slack:C0MENTIONS:1788.400";
+      await adapter.postMessage(threadId, { markdown: resolved });
+      await adapter.editMessage(threadId, "1788.901", { markdown: resolved });
+      expect(postMessage).toHaveBeenCalledWith(expect.objectContaining({ channel: "C0MENTIONS", thread_ts: "1788.400", markdown_text: resolved }));
+      expect(update).toHaveBeenCalledWith(expect.objectContaining({ channel: "C0MENTIONS", ts: "1788.901", markdown_text: resolved }));
+      const chunks = async function* () { yield resolved.slice(0, 12); yield resolved.slice(12); };
+      await expect(adapter.stream(threadId, chunks(), { recipientTeamId: "T0PAPERCLIP", recipientUserId: "U0C9FSX8K5F", updateIntervalMs: 0 })).resolves.toMatchObject({ id: "1788.903" });
+      const streamed = nativeAppend.mock.calls.map(([args]) => String(args.markdown_text ?? "")).join("");
+      expect(streamed).toBe(resolved);
+      expect(nativeStop).toHaveBeenCalledOnce();
+      expect(usersList).not.toHaveBeenCalled();
+      expect(JSON.stringify([postMessage.mock.calls, update.mock.calls, nativeAppend.mock.calls])).not.toContain("<@hi>");
+    } finally { await runtime.shutdown(); }
   });
 
   it("uses one Slack provider call for a file-only publication", async () => {

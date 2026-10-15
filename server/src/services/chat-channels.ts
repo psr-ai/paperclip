@@ -299,6 +299,8 @@ import {
   renderPublicationTransportText,
   splitNativePublicationText,
 } from "./chat-publication-text-parts.js";
+import { resolveSlackPublicationMentions } from "./slack-publication-mentions.js";
+import { loadSlackPublicationParticipants } from "./slack-publication-participants.js";
 import {
   readRegisteredDiscordCommandRegistration,
   reconcileStoredDiscordCommandRegistration,
@@ -35732,7 +35734,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
   async function ensureDurablePublicationTransport(
     publication: typeof chatPublications.$inferSelect,
   ): Promise<typeof chatPublications.$inferSelect> {
-    const persisted = publication.payload as SafeChatPublicationPayload;
+    let persisted = publication.payload as SafeChatPublicationPayload;
     if (
       !persisted ||
       typeof persisted !== "object" ||
@@ -35748,11 +35750,36 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     await options.publicationTransportPreparationBarrier?.({
       publicationId: publication.id,
     });
-    const provider = await db
-      .select({ provider: chatEndpoints.provider })
+    const endpoint = await db
+      .select({ provider: chatEndpoints.provider, providerAccountId: chatEndpoints.providerAccountId })
       .from(chatEndpoints)
-      .where(eq(chatEndpoints.id, publication.endpointId))
-      .then((rows) => rows[0]?.provider ?? null);
+      .where(and(eq(chatEndpoints.id, publication.endpointId), eq(chatEndpoints.companyId, publication.companyId)))
+      .then((rows) => rows[0] ?? null);
+    const provider = endpoint?.provider ?? null;
+    if (provider === "slack" && !persisted.transportPart && persisted.text.includes("@")) {
+      publication = await db.transaction(async (tx) => {
+        const current = await tx.select().from(chatPublications)
+          .where(and(eq(chatPublications.id, publication.id), eq(chatPublications.companyId, publication.companyId)))
+          .for("update").then((rows) => rows[0] ?? null);
+        if (!current) return publication;
+        const currentPayload = current.payload as SafeChatPublicationPayload;
+        renderPublicationTransportText(currentPayload);
+        if (currentPayload.transportPart || !["pending", "retry"].includes(current.state)) return current;
+        // Display names alone are not identities. Only provider-authenticated,
+        // processed inbound participants of this exact conversation may resolve
+        // a bare name, never principals from another channel/account/company.
+        const participants = await loadSlackPublicationParticipants(tx, current);
+        const text = resolveSlackPublicationMentions(currentPayload.text, participants);
+        if (text === currentPayload.text) return current;
+        const payload = { ...currentPayload, text };
+        const updatedAt = new Date();
+        await tx.update(chatPublications).set({ payload, updatedAt }).where(eq(chatPublications.id, current.id));
+        return { ...current, payload, updatedAt };
+      });
+      // Save canonical IDs before splitting, provider calls, or retries. Every
+      // post/edit/stream lane consumes this same durable text.
+      persisted = publication.payload as SafeChatPublicationPayload;
+    }
     if (
       provider === "slack" ||
       provider === "github" ||

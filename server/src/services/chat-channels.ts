@@ -1,3 +1,4 @@
+import { explicitSlackBotMention, isSlackBotEvent, rememberRecoveredSlackBotMention, slackBotMessageAllowed, SLACK_BOT_BUDGET_EXHAUSTED, SLACK_BOT_ENDPOINT_MINUTE_LIMIT, SLACK_BOT_MESSAGE_DENIED, SLACK_BOT_THREAD_TURN_LIMIT } from "./slack-bot-messages.js";
 import { withSlackBoardLease } from "./slack-board-lease.js";
 import { mirrorSlackBoardComment, slackBoardReplyBindings } from "./slack-board-messages.js";
 import { authorizeSlackBoardPublication } from "./slack-board-authority.js";
@@ -106,6 +107,7 @@ import {
   companySecretBindings,
   heartbeatRunEvents,
   heartbeatRuns,
+  runIdentityContexts,
   nativeRunFinalizations,
   nativeRunResults,
   environmentLeases,
@@ -2706,6 +2708,7 @@ function providerSetupState(
           (surface) => surface.status === "stale",
         ),
         slackApp: endpoint.setup.slackApp,
+        slackBotMessages: endpoint.setup.slackBotMessages,
         // Slack registers the slash command in the provider configuration.
         // Keep that identity immutable when the assigned agent is renamed;
         // deriving it remains only a compatibility path for older rows.
@@ -6109,6 +6112,17 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             slackApp: input.slackApp,
             command: input.slackApp.command,
           };
+        }
+        if (input.slackBotMessages !== undefined) {
+          if (existing.endpoint.provider !== "slack") throw unprocessable("Bot message policy only applies to Slack connections");
+          if (input.slackBotMessages.allowlist.length > 0 &&
+            (!existing.endpoint.sponsorUserId || !(await sponsorAllowsGuest(existing.endpoint)))) {
+            throw forbidden("Slack bot messages require an active endpoint sponsor");
+          }
+          if (input.slackBotMessages.allowlist.some((entry) => entry.botUserId === existing.endpoint.botExternalId)) {
+            throw unprocessable("The connected Slack bot cannot authorize its own messages");
+          }
+          values.setup = { ...(values.setup ?? existing.endpoint.setup), slackBotMessages: input.slackBotMessages };
         }
         if (input.allowDirectMessages !== undefined)
           values.allowDirectMessages = input.allowDirectMessages;
@@ -10274,12 +10288,18 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         set: {
           displayName: author.fullName,
           handle: author.userName,
-          isBot: author.isBot === true || author.isMe,
+          // A replay with older metadata must never turn a known machine into
+          // a human identity eligible for a user link.
+          kind: author.isBot === true ? "bot" : sql`${chatExternalPrincipals.kind}`,
+          isBot: sql`${chatExternalPrincipals.isBot} or ${author.isBot === true || author.isMe}`,
           lastSeenAt: new Date(),
           updatedAt: new Date(),
         },
       })
       .returning();
+    if (principal.isBot || principal.kind !== "user") {
+      return { principal, userId: null, linkedDenied: false };
+    }
     const link = await db
       .select({
         userId: chatIdentityLinks.paperclipUserId,
@@ -10350,6 +10370,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     tx: DbOrTransaction,
     endpoint: EndpointRow,
     principalId: string,
+    botMessageContext?: Record<string, unknown>,
   ): Promise<{
     allowed: boolean;
     linkedDenied: boolean;
@@ -10365,6 +10386,28 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     await tx.execute(
       sql`select pg_advisory_xact_lock(hashtextextended(${`chat-identity:${endpoint.companyId}:${principalId}`}, 0))`,
     );
+    if (endpoint.provider === "slack") {
+      const [principal] = await tx.select().from(chatExternalPrincipals).where(and(
+        eq(chatExternalPrincipals.id, principalId),
+        eq(chatExternalPrincipals.companyId, endpoint.companyId),
+        eq(chatExternalPrincipals.provider, "slack"),
+        eq(chatExternalPrincipals.providerAccountId, endpoint.providerAccountId ?? "unknown"),
+      )).for("share");
+      if (!principal) return { allowed: false, linkedDenied: false, userId: null };
+      if (principal.isBot || principal.kind !== "user" || isSlackBotEvent(botMessageContext)) {
+        const contextPrincipal = githubPolicyRecord(botMessageContext?.principal);
+        if (!principal.isBot || principal.kind !== "bot" || contextPrincipal.externalId !== principal.externalId ||
+          !slackBotMessageAllowed(endpoint, botMessageContext) || !endpoint.sponsorUserId) {
+          return { allowed: false, linkedDenied: false, userId: null };
+        }
+        const [sponsor] = await tx.select({ status: companyMemberships.status, role: companyMemberships.membershipRole })
+          .from(companyMemberships).where(and(
+            eq(companyMemberships.companyId, endpoint.companyId), eq(companyMemberships.principalType, "user"),
+            eq(companyMemberships.principalId, endpoint.sponsorUserId),
+          )).for("update");
+        return { allowed: sponsor?.status === "active" && sponsor.role !== "viewer", linkedDenied: false, userId: null };
+      }
+    }
     const link = await tx
       .select({
         status: chatIdentityLinks.status,
@@ -11750,6 +11793,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       tx,
       endpoint,
       action.principalId,
+      delivery.normalizedEvent,
     );
     const automatic = delivery.normalizedEvent.githubAutomatic as { context: GitHubReviewEventContext } | undefined;
     if (endpoint.provider === "github" && automatic) {
@@ -11766,6 +11810,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ? endpoint.allowDirectMessages
         : nonDirectDestinationAllowed(endpoint, resource)) ||
       !authorization.allowed ||
+      (isSlackBotEvent(delivery.normalizedEvent) && issue.responsibleUserId !== endpoint.sponsorUserId) ||
       authorization.userId !== expectedUserId ||
       (payload.requestedByActorType === "system" &&
         payload.requestedByActorId !== action.principalId)
@@ -13623,6 +13668,69 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
     return inserted;
   }
 
+  async function authorizeSlackBotPublication(
+    tx: DbOrTransaction,
+    publication: typeof chatPublications.$inferSelect,
+    run: typeof heartbeatRuns.$inferSelect | null,
+    noticeWakeId: string | null,
+  ): Promise<boolean> {
+    if (isExplicitOperatorPublication(publication)) return true;
+    const [endpoint] = await tx.select().from(chatEndpoints).where(and(
+      eq(chatEndpoints.id, publication.endpointId), eq(chatEndpoints.companyId, publication.companyId), eq(chatEndpoints.provider, "slack"),
+    )).for("no key update", { noWait: true });
+    if (!endpoint || endpoint.provider !== "slack") return true;
+    const snapshot = run?.contextSnapshot ?? {};
+    let commentIds = [publication.commentId, snapshot.wakeCommentId, snapshot.commentId,
+      ...(Array.isArray(snapshot.wakeCommentIds) ? snapshot.wakeCommentIds : [])]
+      .filter((id): id is string => typeof id === "string" && isUuidLike(id));
+    let wakeIds = [noticeWakeId, run?.wakeupRequestId].filter((id): id is string => typeof id === "string");
+    let responsibleUserId = run?.responsibleUserId ?? null;
+    if (run) {
+      const [comment] = publication.commentId ? await tx.select({ createdAt: issueComments.createdAt }).from(issueComments)
+        .where(and(eq(issueComments.id, publication.commentId), eq(issueComments.companyId, endpoint.companyId))) : [];
+      let [identity] = await tx.select().from(runIdentityContexts).where(and(
+        eq(runIdentityContexts.companyId, endpoint.companyId), eq(runIdentityContexts.runId, run.id),
+        eq(runIdentityContexts.status, "accepted"), lte(runIdentityContexts.createdAt, comment?.createdAt ?? publication.createdAt),
+      )).orderBy(desc(runIdentityContexts.revision)).limit(1);
+      if (identity) {
+        responsibleUserId = identity.responsibleUserId;
+        // A later human turn in a persistent run must not inherit an older
+        // bot grant. Use immutable response-time provenance, including recovery.
+        const seen = new Set<string>();
+        while (identity && !identity.messageId && identity.parentContextId) {
+          if (seen.has(identity.id) || seen.size >= 32) return false;
+          seen.add(identity.id);
+          [identity] = await tx.select().from(runIdentityContexts).where(and(
+            eq(runIdentityContexts.id, identity.parentContextId), eq(runIdentityContexts.companyId, endpoint.companyId),
+            eq(runIdentityContexts.status, "accepted"),
+          )).limit(1);
+          if (!identity || identity.responsibleUserId !== responsibleUserId) return false;
+        }
+        if (identity?.messageId) {
+          commentIds = [identity.messageId];
+          wakeIds = [];
+        }
+      }
+    }
+    if (!commentIds.length && !wakeIds.length) return true;
+    const sources = await tx.select({ delivery: chatDeliveries, principal: chatExternalPrincipals })
+      .from(chatActions)
+      .innerJoin(chatDeliveries, and(eq(chatDeliveries.id, chatActions.deliveryId), eq(chatDeliveries.companyId, endpoint.companyId)))
+      .innerJoin(chatExternalPrincipals, and(eq(chatExternalPrincipals.id, chatActions.principalId), eq(chatExternalPrincipals.companyId, endpoint.companyId)))
+      .where(and(eq(chatActions.companyId, endpoint.companyId), eq(chatActions.endpointId, endpoint.id),
+        eq(chatActions.conversationId, publication.conversationId), eq(chatActions.kind, "inbound_wakeup"),
+        eq(sql<string>`${chatActions.payload}->>'issueId'`, publication.issueId),
+        or(commentIds.length ? inArray(sql<string>`${chatActions.payload}->>'commentId'`, commentIds) : undefined,
+          wakeIds.length ? inArray(chatActions.id, wakeIds) : undefined)));
+    for (const source of sources) {
+      if (!source.principal.isBot && !isSlackBotEvent(source.delivery.normalizedEvent)) continue;
+      if (run && responsibleUserId !== endpoint.sponsorUserId) return false;
+      const authorization = await lockCurrentPrincipalAuthorization(tx, endpoint, source.principal.id, source.delivery.normalizedEvent);
+      if (!authorization.allowed) return false;
+    }
+    return true;
+  }
+
   async function authorizeRetainedChatSourcePublication(
     tx: DbOrTransaction,
     publication: typeof chatPublications.$inferSelect,
@@ -13668,6 +13776,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           )
       : [];
     try {
+      if (!(await authorizeSlackBotPublication(tx, publication, run ?? null, notice?.wakeId ?? null))) return false;
       const committed = run?.resultJson?.nativeCommittedChatResponse;
       if (committed !== undefined) {
         if (
@@ -14399,6 +14508,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           | Record<string, number>
           | undefined,
         durableChatRequest: request,
+        ...(context.endpoint.provider === "slack" && isSlackBotEvent(context.delivery.normalizedEvent)
+          ? { allowRunCoalescing: false } : {}),
         rethrowOnError: true,
       });
       const durable = await receipt();
@@ -14498,7 +14609,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       return;
     if (
       message.author.isMe ||
-      message.author.isBot === true ||
+      (endpoint.provider === "slack" && message.author.userId === endpoint.botExternalId) ||
+      (message.author.isBot === true && endpoint.provider !== "slack") ||
       message.author.isSystem
     )
       return;
@@ -14673,6 +14785,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         ),
         displayName: message.author.fullName,
         handle: message.author.userName,
+        isBot: message.author.isBot === true,
+        kind: message.author.isBot === true ? "bot" : "user",
       },
       resource: {
         type: providerResourceType(endpoint.provider, surfaceKind),
@@ -14702,6 +14816,8 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           endpoint.provider === "telegram" ? (providerUpdateId ?? null) : null,
         text: message.text.slice(0, MAX_INBOUND_TEXT),
         mentionedBot: message.isMention === true,
+        ...(endpoint.provider === "slack" && message.author.isBot === true
+          ? { slackBotMentioned: explicitSlackBotMention(message, endpoint.botExternalId) } : {}),
         providerSentAt: providerSentAt?.toISOString() ?? null,
         ...(providerSentAtSource ? { providerSentAtSource } : {}),
         ...((endpoint.provider === "github" ||
@@ -15592,16 +15708,18 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       const destinationAllowed = thread.isDM
         ? endpoint.allowDirectMessages
         : nonDirectDestinationAllowed(endpoint, resource);
+      const slackBot = endpoint.provider === "slack" && principalResolution.principal.isBot;
+      const botAllowed = slackBot && slackBotMessageAllowed(endpoint, normalized) && await sponsorAllowsGuest(endpoint);
       const guestSponsorAllowed =
-        principalResolution.userId === null &&
+        !slackBot && principalResolution.userId === null &&
         !principalResolution.linkedDenied &&
         endpoint.allowUnlinkedPeople
           ? await sponsorAllowsGuest(endpoint)
           : false;
       const principalAllowed =
         !principalResolution.linkedDenied &&
-        (principalResolution.userId !== null || guestSponsorAllowed);
-      const activationAllowed = addressed || existingConversation !== null;
+        (slackBot ? botAllowed : principalResolution.userId !== null || guestSponsorAllowed);
+      const activationAllowed = slackBot ? botAllowed : addressed || existingConversation !== null;
       const allowed =
         endpointAllowed &&
         destinationAllowed &&
@@ -15673,7 +15791,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             : principalResolution.linkedDenied
               ? "Linked Paperclip account is not currently permitted"
               : !principalAllowed
-                ? endpoint.allowUnlinkedPeople
+                ? slackBot ? SLACK_BOT_MESSAGE_DENIED : endpoint.allowUnlinkedPeople
                   ? "Endpoint sponsor can no longer authorize external guests"
                   : "External identity must be linked to a Paperclip account"
                 : "Message did not address the agent or an active task thread";
@@ -15763,9 +15881,15 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
 
       const emptySlackMention =
         endpoint.provider === "slack" &&
-        (trigger === "mention" || message.isMention === true) &&
+        (trigger === "mention" || message.isMention === true || (slackBot && normalized.message.slackBotMentioned === true)) &&
         message.attachments.length === 0 &&
         !hasMeaningfulSlackMentionRequest(message.text);
+      if (emptySlackMention && slackBot) {
+        await db.update(chatDeliveries).set({ state: "filtered", normalizedEvent: redactedDestinationNormalized,
+          principalId: null, processedAt: new Date(), nextAttemptAt: null, updatedAt: new Date(),
+          redactedError: SLACK_BOT_MESSAGE_DENIED }).where(eq(chatDeliveries.id, activeDelivery.id));
+        return;
+      }
       if (emptySlackMention) {
         const effectContext =
           runtimeContext ??
@@ -16099,7 +16223,10 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 .then((rows) => rows[0] ?? null);
         if (!issue) throw notFound("Bound task not found");
           const [assignedAgentTrust] = taskEndpoint.provider === "github" ? await taskTx.select({ permissions: agents.permissions }).from(agents).where(and(eq(agents.companyId, taskEndpoint.companyId), eq(agents.id, taskEndpoint.assignedAgentId))) : [];
-        if (!taskUserId || (githubAutomatic && !principalResolution.userId) || assignedAgentTrust?.permissions?.trustPreset === LOW_TRUST_REVIEW_PRESET) {
+        // A configured bot/channel pair is an explicit machine grant, not an
+        // unlinked-human guest. Keep its system attribution and sponsor without
+        // imposing (or removing) an existing task/agent isolation policy.
+        if ((!taskUserId && !slackBot) || (githubAutomatic && !principalResolution.userId) || assignedAgentTrust?.permissions?.trustPreset === LOW_TRUST_REVIEW_PRESET) {
             const reviewPreset = {
               id: LOW_TRUST_REVIEW_PRESET,
               version: LOW_TRUST_REVIEW_PRESET_VERSION,
@@ -16240,18 +16367,23 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                         message.raw,
                       ),
                     },
+                    ...(slackBot ? [{
+                      type: "key_value" as const,
+                      label: "Reply mention",
+                      value: `<@${principalResolution.principal.externalId}>`,
+                    }] : []),
                     {
                       type: "key_value",
                       label: "Authority",
                       value: taskUserId
                         ? "Linked Paperclip user"
-                        : "Sponsored external guest (restricted)",
+                        : message.author.isBot === true ? "Authorized external bot (sponsored)" : "Sponsored external guest (restricted)",
                     },
                   ],
                 },
               ],
             },
-            sourceTrust: taskUserId
+            sourceTrust: taskUserId || slackBot
               ? null
               : {
                   preset: LOW_TRUST_REVIEW_PRESET,
@@ -16379,7 +16511,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
             tx,
             currentEndpoint,
             principalResolution.principal.id,
+            normalized,
           );
+        if (slackBot && existingConversation) {
+          const [currentIssue] = await tx.select({ responsibleUserId: issues.responsibleUserId }).from(issues)
+            .where(and(eq(issues.id, existingConversation.issueId), eq(issues.companyId, currentEndpoint.companyId))).for("update");
+          if (currentIssue?.responsibleUserId !== currentEndpoint.sponsorUserId) currentPrincipalAuthorization.allowed = false;
+        }
         const automaticAdmission = githubAutomatic ? await githubAutomaticAdmission(tx, currentEndpoint, githubAutomatic.context) : null;
         if (githubAutomatic && !automaticAdmission?.allowed) currentPrincipalAuthorization.allowed = false;
         if (automaticAdmission?.allowed) currentPrincipalAuthorization.userId = automaticAdmission.responsibleUserId ?? null;
@@ -16407,7 +16545,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
                 ? destinationStillAllowed
                   ? currentPrincipalAuthorization.linkedDenied
                     ? "Linked Paperclip account is not currently permitted"
-                    : currentEndpoint.allowUnlinkedPeople
+                    : slackBot ? SLACK_BOT_MESSAGE_DENIED : currentEndpoint.allowUnlinkedPeople
                       ? "Endpoint sponsor can no longer authorize external guests"
                       : "External identity must be linked to a Paperclip account"
                   : "Destination is not enabled in Paperclip"
@@ -16469,6 +16607,26 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         // Recheck after the lock: an old input held between precheck and task
         // mutation must not create work after that control commits.
         if (await filterPreControlSource(tx)) return null;
+        if (slackBot) {
+          // The endpoint row is locked above. Count durable wake intents, not
+          // callbacks, so duplicate delivery/recovery cannot spend twice and
+          // concurrent threads cannot race the endpoint-wide ceiling.
+          const [usage] = await tx.select({
+            threadTurns: sql<number>`count(*) filter (where ${chatDeliveries.normalizedEvent}->'conversation'->>'externalThreadId' = ${thread.id})::int`,
+            recentTurns: sql<number>`count(*) filter (where ${gt(chatActions.createdAt, new Date(Date.now() - 60_000))})::int`,
+          }).from(chatActions).innerJoin(chatDeliveries, and(
+            eq(chatDeliveries.id, chatActions.deliveryId), eq(chatDeliveries.companyId, currentEndpoint.companyId),
+            eq(chatDeliveries.endpointId, currentEndpoint.id),
+          )).where(and(eq(chatActions.companyId, currentEndpoint.companyId), eq(chatActions.endpointId, currentEndpoint.id),
+            eq(chatActions.kind, "inbound_wakeup"), ne(chatDeliveries.id, activeDelivery.id),
+            sql`${chatDeliveries.normalizedEvent}->'principal'->>'isBot' = 'true'`));
+          if ((usage?.threadTurns ?? 0) >= SLACK_BOT_THREAD_TURN_LIMIT || (usage?.recentTurns ?? 0) >= SLACK_BOT_ENDPOINT_MINUTE_LIMIT) {
+            await tx.update(chatDeliveries).set({ state: "filtered", normalizedEvent: redactedDestinationNormalized,
+              principalId: null, processedAt: new Date(), nextAttemptAt: null, updatedAt: new Date(),
+              redactedError: SLACK_BOT_BUDGET_EXHAUSTED }).where(eq(chatDeliveries.id, activeDelivery.id));
+            return null;
+          }
+        }
         return persistTaskMutation(
           tx,
           currentPrincipalAuthorization.sponsorUserId ? { ...currentEndpoint, sponsorUserId: currentPrincipalAuthorization.sponsorUserId } : currentEndpoint,
@@ -17067,11 +17225,13 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
         externalId?: unknown;
         displayName?: unknown;
         handle?: unknown;
+        isBot?: unknown;
       };
       message?: {
         providerMessageId?: unknown;
         text?: unknown;
         mentionedBot?: unknown;
+        slackBotMentioned?: unknown;
         attachments?: Array<{
           name?: unknown;
           mimeType?: unknown;
@@ -17185,7 +17345,7 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
           typeof normalized.principal?.displayName === "string"
             ? normalized.principal.displayName
             : externalId,
-        isBot: false,
+        isBot: normalized.principal?.isBot === true,
         isMe: false,
         isSystem: false,
       },
@@ -17194,6 +17354,9 @@ export function chatChannelService(db: Db, options: ChatChannelServiceOptions) {
       links: [],
       isMention: normalized.message?.mentionedBot === true,
     } as unknown as Message;
+    if (endpointRuntime.provider === "slack" && normalized.principal?.isBot === true && normalized.message?.slackBotMentioned === true) {
+      rememberRecoveredSlackBotMention(message);
+    }
     const githubManual = delivery.normalizedEvent.githubManual;
     if (endpointRuntime.provider === "github" && githubManual && typeof githubManual === "object") githubManualMessages.set(message, githubManual as { policy: GitHubReviewPolicy; revision: number; event: "mention" | "comment" });
     const githubAutomatic = delivery.normalizedEvent.githubAutomatic;

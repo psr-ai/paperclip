@@ -39,6 +39,8 @@ export function queueIssueAssignmentWakeup(input: {
   attachmentOmissionReasons?: Record<string, number> | null;
   rethrowOnError?: boolean;
   durableChatRequest?: DurableChatWakeupRequest;
+  /** Keep a machine-sponsored turn separate from an earlier human identity. */
+  allowRunCoalescing?: boolean;
 }) {
   if (!input.issue.assigneeAgentId || input.issue.status === "backlog") return;
 
@@ -55,6 +57,9 @@ export function queueIssueAssignmentWakeup(input: {
       },
       requestedByActorType: input.requestedByActorType,
       requestedByActorId: input.requestedByActorId ?? null,
+      ...(input.allowRunCoalescing !== undefined
+        ? { allowRunCoalescing: input.allowRunCoalescing }
+        : {}),
       ...(input.durableChatRequest
         ? { durableChatRequest: input.durableChatRequest }
         : {}),

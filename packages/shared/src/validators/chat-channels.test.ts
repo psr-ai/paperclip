@@ -5,7 +5,28 @@ import {
   resolveChatActionSchema,
   resolveChatPublicationSchema,
   chatPublicationStateSchema,
+  updateChatEndpointSchema,
 } from "./chat-channels.js";
+
+describe("Slack bot message policy validation", () => {
+  it("accepts exact bot/channel grants and an empty list to revoke them", () => {
+    const slackBotMessages = { allowlist: [{ botUserId: "U0BOTREQUESTER", channelId: "C0BOTREQUESTS" }] };
+    expect(updateChatEndpointSchema.parse({ slackBotMessages })).toEqual({ slackBotMessages });
+    expect(updateChatEndpointSchema.parse({ slackBotMessages: { allowlist: [] } })).toEqual({ slackBotMessages: { allowlist: [] } });
+  });
+
+  it.each([
+    { allowlist: [{ botUserId: "*", channelId: "C0BOTREQUESTS" }] },
+    { allowlist: [{ botUserId: "U0BOTREQUESTER", channelId: "*" }] },
+    { allowlist: [{ botUserId: "B0BOTREQUESTER", channelId: "C0BOTREQUESTS" }] },
+    { allowlist: [{ botUserId: "U0BOTREQUESTER", channelId: "D0BOTREQUESTS" }] },
+    { allowlist: [{ botUserId: "U0BOTREQUESTER", channelId: "C0BOTREQUESTS", sponsorUserId: "spoofed-owner" }] },
+    { allowlist: [], allowAll: true },
+    { allowlist: Array.from({ length: 21 }, (_, index) => ({ botUserId: `U0BOT${index}`, channelId: "C0BOTREQUESTS" })) },
+  ])("rejects broad or malformed grants %#", (slackBotMessages) => {
+    expect(updateChatEndpointSchema.safeParse({ slackBotMessages }).success).toBe(false);
+  });
+});
 
 describe("Microsoft Teams chat credential validation", () => {
   it("normalizes canonical Entra application and tenant UUIDs", () => {

@@ -187,7 +187,12 @@ export interface SlackAppConfiguration {
   command: string;
 }
 
+export interface SlackBotMessagePolicy {
+  allowlist: Array<{ botUserId: string; channelId: string }>;
+}
+
 export interface ChatEndpointSetupState {
+  slackBotMessages?: SlackBotMessagePolicy;
   github?: {
     stage: "connect" | "install" | "repositories" | "verify" | "identity" | "behavior" | "test";
     appSlug?: string;
@@ -482,6 +487,8 @@ export interface CreateChatEndpointInput {
 }
 
 export interface UpdateChatEndpointInput {
+  /** Explicit machine senders; independent of human identity linking. */
+  slackBotMessages?: SlackBotMessagePolicy;
   slackApp?: SlackAppConfiguration;
   communicationInstructions?: string;
   allowDirectMessages?: boolean;

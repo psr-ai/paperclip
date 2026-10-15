@@ -84,6 +84,15 @@ export const slackAppConfigurationSchema = z.object({
 
 export const updateChatEndpointSchema = z
   .object({
+    slackBotMessages: z.object({
+      allowlist: z.array(z.object({
+        botUserId: z.string().regex(/^[UW][A-Z0-9]{2,63}$/),
+        channelId: z.string().regex(/^[CG][A-Z0-9]{2,63}$/),
+      }).strict()).max(20).refine(
+        (entries) => new Set(entries.map((entry) => `${entry.botUserId}:${entry.channelId}`)).size === entries.length,
+        "Bot and channel pairs must be unique",
+      ),
+    }).strict().optional(),
     communicationInstructions: multilineTextSchema.pipe(z.string().trim().max(4000)).optional(),
     slackApp: slackAppConfigurationSchema.optional(),
     allowDirectMessages: z.boolean().optional(),

@@ -152,8 +152,10 @@ import {
 } from "../services/chat-run-publications.js";
 import {
   heartbeatService,
+  preflightLowTrustWorkspaceIsolation,
   resolveExternalChatWakeProvider,
 } from "../services/heartbeat.js";
+import { resolveAndRetainRunTrustPreset } from "../services/run-trust-preset.js";
 import {
   registerServerAdapter,
   unregisterServerAdapter,
@@ -22023,6 +22025,357 @@ describeEmbeddedPostgres("chat channel control-plane integration", () => {
       .where(eq(agentWakeupRequests.companyId, fixture.companyId));
     expect(await heldIssues()).toEqual([]);
     await service.shutdown();
+  });
+
+  describe("governed Slack bot mentions", () => {
+    const senderId = "U0BOTREQUESTER";
+    const channelId = "C0BOTREQUESTS";
+
+    async function botFixture(
+      overrides: Parameters<typeof configuredSlackEndpoint>[1] = {},
+      allowlisted = true,
+    ) {
+      const fixture = await seedCompany();
+      const configured = await configuredSlackEndpoint(fixture, {
+        allowUnlinkedPeople: false,
+        fetch: fakeSlackFetch(`U0PAPERCLIP${randomUUID().replaceAll("-", "").toUpperCase()}`) as typeof globalThis.fetch,
+        ...overrides,
+      });
+      const { endpoint, service } = configured;
+      await db.update(chatEndpoints).set({ status: "active" }).where(eq(chatEndpoints.id, endpoint.id));
+      if (allowlisted) {
+        await service.update(endpoint.id, {
+          slackBotMessages: { allowlist: [{ botUserId: senderId, channelId }] },
+        }, "owner-user");
+      }
+      const [resource] = await db.insert(chatEndpointResources).values({
+        companyId: fixture.companyId,
+        endpointId: endpoint.id,
+        type: "channel",
+        providerResourceId: channelId,
+        label: "bot-requests",
+        availability: "available",
+        enabled: true,
+      }).returning();
+      const current = await service.get(endpoint.id);
+      const message = (id: string, extra: {
+        mentioned?: boolean;
+        userId?: string;
+        self?: boolean;
+        text?: string;
+      } = {}) => {
+        const mentioned = extra.mentioned ?? true;
+        const text = extra.text ?? (mentioned ? `<@${current.botExternalId}> perform this bounded request` : "An ordinary bot update");
+        const result = makeMessage({
+          id,
+          text,
+          mentioned,
+          userId: extra.userId ?? senderId,
+          userName: "hi-dot",
+          raw: { type: mentioned ? "app_mention" : "message", text, user: extra.userId ?? senderId, bot_id: "B0REQUESTER", channel: channelId, ts: id },
+        });
+        result.author = { ...result.author, isBot: true, isMe: extra.self ?? false };
+        return result;
+      };
+      const thread = (root = "9900.1", targetChannel = channelId, isDM = false) => makeThread({
+        channelId: targetChannel,
+        id: `slack:${targetChannel}:${root}`,
+        isDM,
+        name: "bot-requests",
+      });
+      const send = (id: string, options: {
+        root?: string;
+        targetChannel?: string;
+        isDM?: boolean;
+        mentioned?: boolean;
+        userId?: string;
+        self?: boolean;
+        text?: string;
+        trigger?: ChatSdkMessageTrigger;
+      } = {}) => deliverMessage({
+        callbacks: configured.callbacks,
+        endpointId: endpoint.id,
+        thread: thread(options.root, options.targetChannel, options.isDM).thread,
+        message: message(id, options),
+        trigger: options.trigger ?? (options.isDM ? "direct_message" : options.mentioned === false ? "subscribed_message" : "mention"),
+      });
+      return { ...configured, fixture, current, message, resource: resource!, send, thread };
+    }
+
+    it("accepts an explicitly granted machine without impersonation or forcing guest-only runtime isolation", async () => {
+      const f = await botFixture();
+      await f.send("9900.1");
+      const [conversation] = await f.service.listConversations(f.endpoint.id);
+      expect(conversation).toBeDefined();
+      const [task] = await db.select().from(issues).where(eq(issues.id, conversation!.issueId));
+      expect(task.responsibleUserId).toBe("owner-user");
+      expect(task.sourceTrust).toBeNull();
+      const [principal] = await db.select().from(chatExternalPrincipals).where(and(
+        eq(chatExternalPrincipals.companyId, f.fixture.companyId),
+        eq(chatExternalPrincipals.externalId, senderId),
+      ));
+      expect(principal).toMatchObject({ kind: "bot", isBot: true });
+      expect(await db.select().from(chatIdentityLinks).where(eq(chatIdentityLinks.principalId, principal!.id))).toEqual([]);
+      const [comment] = await db.select().from(issueComments).where(eq(issueComments.issueId, task.id));
+      expect(comment).toMatchObject({ authorUserId: null, authorAgentId: null });
+      expect(f.wakeup).toHaveBeenCalledTimes(1);
+      expect(f.wakeup.mock.calls[0]?.[1].allowRunCoalescing).toBe(false);
+      const [receipt] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.fixture.companyId));
+      expect(receipt).toMatchObject({ requestedByActorType: "system" });
+      const [run] = await db.insert(heartbeatRuns).values({ companyId: f.fixture.companyId, agentId: f.fixture.assignedAgentId, status: "running" }).returning();
+      const { trustPreset } = await resolveAndRetainRunTrustPreset(db, {
+        companyId: f.fixture.companyId, agentId: f.fixture.assignedAgentId, runId: run!.id,
+        agent: { companyId: f.fixture.companyId, permissions: {} },
+        issue: { companyId: f.fixture.companyId, executionPolicy: task.executionPolicy },
+      });
+      expect(trustPreset.kind).toBe("standard");
+      const resolveEnvironment = vi.fn(async () => "sandbox");
+      await expect(preflightLowTrustWorkspaceIsolation({ db, trustPreset, isolatedWorkspacesEnabled: false, effectiveExecutionWorkspaceMode: null, issue: task, resolveSelectedEnvironmentDriver: resolveEnvironment })).resolves.toBeNull();
+      expect(resolveEnvironment).not.toHaveBeenCalled();
+    });
+
+    it("preserves an existing task's restrictive trust policy when a granted bot follows up", async () => {
+      const f = await botFixture();
+      await f.send("9900.1");
+      const [conversation] = await f.service.listConversations(f.endpoint.id);
+      const sourceTrust = { preset: "low_trust_review", disposition: "quarantined", sourceIssueId: conversation!.issueId } as const;
+      const executionPolicy = { authorizationPolicy: { trustPreset: "low_trust_review", trustBoundary: { mode: "low_trust_review", companyId: f.fixture.companyId, rootIssueId: conversation!.issueId, allowedAgentIds: [f.fixture.assignedAgentId] } } };
+      await db.update(issues).set({ sourceTrust, executionPolicy }).where(eq(issues.id, conversation!.issueId));
+      await f.send("9900.2");
+      const [task] = await db.select().from(issues).where(eq(issues.id, conversation!.issueId));
+      expect(task).toMatchObject({ sourceTrust, executionPolicy });
+    });
+
+    it("keeps bot input denied by default even when human guest access is enabled", async () => {
+      const f = await botFixture({ allowUnlinkedPeople: true }, false);
+      await f.send("9900.1");
+      expect(await f.service.listConversations(f.endpoint.id)).toEqual([]);
+      expect(f.wakeup).not.toHaveBeenCalled();
+      expect(f.runtime.endpoints.get(f.endpoint.id)?.posts).toEqual([]);
+    });
+
+    it("requires company-scoped operator authority and a current sponsor to enable machine grants", async () => {
+      const f = await botFixture({}, false);
+      const foreign = await seedCompany();
+      const grant = { slackBotMessages: { allowlist: [{ botUserId: senderId, channelId }] } };
+      expect((await request(routesApp(db, foreign.companyId, f.service)).patch(`/api/chat-endpoints/${f.endpoint.id}`).send(grant)).status).toBeOneOf([403, 404]);
+      expect((await f.service.get(f.endpoint.id)).setup.slackBotMessages).toBeUndefined();
+      await request(routesApp(db, f.fixture.companyId, f.service)).patch(`/api/chat-endpoints/${f.endpoint.id}`).send(grant).expect(200);
+      expect((await f.service.get(f.endpoint.id)).setup.slackBotMessages).toEqual(grant.slackBotMessages);
+      await expect(f.service.update(f.endpoint.id, { slackBotMessages: { allowlist: [{ botUserId: f.current.botExternalId!, channelId }] } }, "owner-user")).rejects.toMatchObject({ status: 422 });
+      await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(and(eq(companyMemberships.companyId, f.fixture.companyId), eq(companyMemberships.principalId, "owner-user")));
+      await expect(f.service.update(f.endpoint.id, grant, "owner-user")).rejects.toMatchObject({ status: 403 });
+      // Revocation remains available even when the sponsor loses admission authority.
+      await expect(f.service.update(f.endpoint.id, { slackBotMessages: { allowlist: [] } }, "owner-user")).resolves.toBeDefined();
+    });
+
+    it.each(["unmentioned", "wrong_bot", "wrong_channel", "dm", "self", "disabled_channel", "empty", "empty_message_only"] as const)(
+      "does not create work or reply to %s machine input",
+      async (mode) => {
+        const f = await botFixture();
+        if (mode === "disabled_channel") await f.service.replaceResources(f.endpoint.id, [{ id: f.resource.id, enabled: false }]);
+        await f.send("9900.1", {
+          ...(mode === "unmentioned" ? { mentioned: false } : {}),
+          ...(mode === "wrong_bot" ? { userId: "U0OTHERBOT" } : {}),
+          ...(mode === "wrong_channel" ? { targetChannel: "C0OTHERCHANNEL" } : {}),
+          ...(mode === "dm" ? { isDM: true } : {}),
+          ...(mode === "self" ? { userId: f.current.botExternalId!, self: true } : {}),
+          ...(mode === "empty" ? { text: `<@${f.current.botExternalId}>` } : {}),
+          ...(mode === "empty_message_only" ? { text: `<@${f.current.botExternalId}>`, mentioned: false, trigger: "unaddressed_message" as const } : {}),
+        });
+        expect(await f.service.listConversations(f.endpoint.id)).toEqual([]);
+        expect(f.wakeup).not.toHaveBeenCalled();
+        expect(f.runtime.endpoints.get(f.endpoint.id)?.posts).toEqual([]);
+      },
+    );
+
+    it("deduplicates retries and enforces the thread budget across restart and session generations", async () => {
+      const f = await botFixture();
+      await f.send("9900.1");
+      await f.send("9900.1");
+      await f.send("9900.2");
+      await f.send("9900.3");
+      expect(f.wakeup).toHaveBeenCalledTimes(3);
+      const [conversation] = await f.service.listConversations(f.endpoint.id);
+      // Session turnover must not give the same provider thread a fresh loop budget.
+      await db.update(chatConversations).set({ sessionGeneration: 2 }).where(eq(chatConversations.id, conversation!.id));
+      await f.service.shutdown();
+      const fresh = createService();
+      await fresh.service.get(f.endpoint.id);
+      await fresh.service.processPendingDeliveries();
+      const callbacks = fresh.runtime.configurations.get(f.endpoint.id)?.callbacks;
+      // runtimeFor may be lazy until a callback is needed.
+      if (!callbacks) await fresh.service.handleWebhook(f.endpoint.publicId, "slack", new Request("https://paperclip.example/slack", { method: "POST", body: "{}", headers: { "content-type": "application/json" } }));
+      const restartedCallbacks = fresh.runtime.configurations.get(f.endpoint.id)!.callbacks;
+      await deliverMessage({ callbacks: restartedCallbacks, endpointId: f.endpoint.id, thread: f.thread().thread, message: f.message("9900.4"), trigger: "mention" });
+      expect(fresh.wakeup).not.toHaveBeenCalled();
+      const deliveries = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(deliveries.filter((row) => row.state === "processed")).toHaveLength(3);
+      expect(deliveries).toContainEqual(expect.objectContaining({ state: "filtered", redactedError: "Slack bot reply budget exhausted" }));
+    });
+
+    it("shares a durable rolling endpoint budget across distinct threads without counting retries", async () => {
+      const f = await botFixture();
+      for (let index = 0; index < 10; index += 1) {
+        const id = `991${index}.1`;
+        await f.send(id, { root: id });
+        if (index === 0) await f.send(id, { root: id });
+      }
+      expect(f.wakeup).toHaveBeenCalledTimes(10);
+      await f.send("9920.1", { root: "9920.1" });
+      expect(f.wakeup).toHaveBeenCalledTimes(10);
+      const [denied] = await db.select().from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, f.endpoint.id), like(chatDeliveries.providerEventId, "%:9920.1")));
+      expect(denied).toMatchObject({ state: "filtered", redactedError: "Slack bot reply budget exhausted" });
+      await db.update(chatActions).set({ createdAt: new Date(Date.now() - 61_000) }).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "inbound_wakeup")));
+      await f.send("9921.1", { root: "9921.1" });
+      expect(f.wakeup).toHaveBeenCalledTimes(11);
+    });
+
+    it("serializes simultaneous bot turns at the final remaining thread-budget slot", async () => {
+      const f = await botFixture();
+      await f.send("9900.1");
+      await f.send("9900.2");
+      const results = await Promise.allSettled([f.send("9900.3"), f.send("9900.4")]);
+      expect(results.every((result) => result.status === "fulfilled")).toBe(true);
+      await f.service.processPendingDeliveries();
+      expect(f.wakeup).toHaveBeenCalledTimes(3);
+      const intents = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "inbound_wakeup")));
+      expect(intents).toHaveLength(3);
+      const deliveries = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+      expect(deliveries.filter((row) => row.state === "processed")).toHaveLength(3);
+      expect(deliveries.filter((row) => row.redactedError === "Slack bot reply budget exhausted")).toHaveLength(1);
+    });
+
+    it.each(["allowed", "policy_revoked", "sponsor_revoked"] as const)(
+      "recovers durable machine identity and rechecks %s authority after restart",
+      async (mode) => {
+        const f = await botFixture({ deferWebhookProcessing: true, scheduleDeferredWork: () => undefined });
+        await f.send("9900.1");
+        expect(f.wakeup).not.toHaveBeenCalled();
+        const [queued] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+        expect(queued.normalizedEvent).toMatchObject({ principal: { isBot: true } });
+        await f.service.shutdown();
+        if (mode === "policy_revoked") await f.service.update(f.endpoint.id, { slackBotMessages: { allowlist: [] } }, "owner-user");
+        if (mode === "sponsor_revoked") await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(and(eq(companyMemberships.companyId, f.fixture.companyId), eq(companyMemberships.principalId, "owner-user")));
+        await db.update(chatDeliveries).set({ nextAttemptAt: new Date(0) }).where(eq(chatDeliveries.id, queued.id));
+        const fresh = createService();
+        await fresh.service.processPendingDeliveries(1, queued.id);
+        const [recovered] = await db.select().from(chatDeliveries).where(eq(chatDeliveries.id, queued.id));
+        expect(recovered.state).toBe(mode === "allowed" ? "processed" : "filtered");
+        expect(fresh.wakeup).toHaveBeenCalledTimes(mode === "allowed" ? 1 : 0);
+        if (mode === "allowed") {
+          const [principal] = await db.select().from(chatExternalPrincipals).where(eq(chatExternalPrincipals.id, recovered.principalId!));
+          expect(principal).toMatchObject({ kind: "bot", isBot: true });
+        } else {
+          expect(await fresh.service.listConversations(f.endpoint.id)).toEqual([]);
+        }
+      },
+    );
+
+    it.each(["policy_revoked", "sponsor_revoked"] as const)(
+      "rechecks %s at the atomic task mutation boundary",
+      async (mode) => {
+        let release!: () => void;
+        let entered!: () => void;
+        const ready = new Promise<void>((resolve) => { entered = resolve; });
+        const hold = new Promise<void>((resolve) => { release = resolve; });
+        const f = await botFixture({ reachAuthorizationBarrier: async () => { entered(); await hold; } });
+        const sending = f.send("9900.1");
+        try {
+          await ready;
+          if (mode === "policy_revoked") await f.service.update(f.endpoint.id, { slackBotMessages: { allowlist: [] } }, "owner-user");
+          else await db.update(companyMemberships).set({ membershipRole: "viewer" }).where(and(eq(companyMemberships.companyId, f.fixture.companyId), eq(companyMemberships.principalId, "owner-user")));
+        } finally { release(); }
+        await sending;
+        expect(await f.service.listConversations(f.endpoint.id)).toEqual([]);
+        expect(await db.select().from(issueComments).where(eq(issueComments.companyId, f.fixture.companyId))).toEqual([]);
+        expect(f.wakeup).not.toHaveBeenCalled();
+      },
+    );
+
+    it("rechecks bot policy inside durable scheduler admission", async () => {
+      let revoke: (() => Promise<void>) | undefined;
+      const f = await botFixture({ wakeup: async () => { await revoke?.(); return { accepted: true }; } });
+      revoke = () => f.service.update(f.endpoint.id, { slackBotMessages: { allowlist: [] } }, "owner-user").then(() => undefined);
+      await f.send("9900.1");
+      expect(f.wakeup).toHaveBeenCalledTimes(1);
+      expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.companyId, f.fixture.companyId))).toEqual([]);
+      const [intent] = await db.select().from(chatActions).where(and(eq(chatActions.endpointId, f.endpoint.id), eq(chatActions.kind, "inbound_wakeup")));
+      expect(intent.status).toBe("failed");
+    });
+
+    it.each([false, true])("rechecks a bot-origin final before Slack publication (revoked: %s)", async (revoked) => {
+      const f = await botFixture();
+      await f.send("9900.1");
+      const [conversation] = await f.service.listConversations(f.endpoint.id);
+      const runId = randomUUID();
+      const contextSnapshot = await chatWakeContext({ endpointId: f.endpoint.id, issueId: conversation!.issueId, provider: "slack", providerMessageId: "9900.1" });
+      await db.insert(heartbeatRuns).values({
+        id: runId, companyId: f.fixture.companyId, agentId: f.fixture.assignedAgentId, responsibleUserId: "owner-user", status: "succeeded", invocationSource: "assignment", contextSnapshot,
+      });
+      await initializeRunIdentity(db, { companyId: f.fixture.companyId, runId, issueId: conversation!.issueId, responsibleUserId: "owner-user", messageIds: [contextSnapshot.wakeCommentId], cause: "instruction" });
+      const finalComment = await addSelectedChatFinal({ companyId: f.fixture.companyId, issueId: conversation!.issueId, agentId: f.fixture.assignedAgentId, runId, body: "Bounded machine-request answer" });
+      if (revoked) await f.service.update(f.endpoint.id, { slackBotMessages: { allowlist: [] } }, "owner-user");
+      await f.service.processPendingPublications();
+      const posts = f.runtime.endpoints.get(f.endpoint.id)?.posts ?? [];
+      if (revoked) expect(posts).toEqual([]);
+      else expect(posts).toContainEqual(expect.objectContaining({ text: "Bounded machine-request answer" }));
+      const publications = await db.select().from(chatPublications).where(and(eq(chatPublications.endpointId, f.endpoint.id), eq(chatPublications.commentId, finalComment.id)));
+      expect(publications.length).toBeGreaterThan(0);
+      expect(publications.some((publication) => publication.state === "published")).toBe(!revoked);
+    });
+
+    it("admits a signed bot mention through the actual Slack SDK and deduplicates retry events", async () => {
+      const f = await botFixture({ deferWebhookProcessing: true, scheduleDeferredWork: () => undefined });
+      const pinned = createChatSdkEndpointRuntime({ ...f.runtime.configurations.get(f.endpoint.id)!, logger: "silent" });
+      const fake = f.runtime.endpoints.get(f.endpoint.id)!;
+      Object.assign(fake, { handleWebhook: (req: Request) => pinned.handleWebhook(req) });
+      try {
+        await pinned.initialize();
+        const adapter = pinned.getProviderAdapter() as unknown as {
+          _client: {
+            users: { info: (args: unknown) => Promise<unknown> };
+            conversations: { info: (args: unknown) => Promise<unknown>; replies: (args: unknown) => Promise<unknown> };
+            reactions: { add: (args: unknown) => Promise<unknown> };
+          };
+        };
+        adapter._client.users.info = vi.fn(async () => ({ ok: true, user: { id: senderId, name: "hi-dot", is_bot: true, profile: { display_name: "hi-dot" } } }));
+        adapter._client.conversations.info = vi.fn(async () => ({ ok: true, channel: { id: channelId, name: "bot-requests", is_member: true } }));
+        adapter._client.conversations.replies = vi.fn(async () => ({ ok: true, messages: [], has_more: false }));
+        adapter._client.reactions.add = vi.fn(async () => ({ ok: true }));
+        const payload = (eventType: string, eventId: string, ts = "9940.1", subtype?: string) => JSON.stringify({
+          type: "event_callback", team_id: "T-PAPERCLIP", event_id: eventId,
+          event: { type: eventType, subtype, user: senderId, bot_id: "B0REQUESTER", text: `<@${f.current.botExternalId}> bounded bot request`, ts, channel: channelId, channel_type: "channel", team: "T-PAPERCLIP" },
+        });
+        const send = (type: string, eventId: string, signingSecret = "test-signing-secret", ts = "9940.1", subtype?: string) => f.service.handleWebhook(f.endpoint.publicId, "slack", signedSlackWebhookRequest({
+          url: `https://paperclip.example/api/chat-webhooks/${f.endpoint.publicId}/slack`, contentType: "application/json", body: payload(type, eventId, ts, subtype), signingSecret,
+        }));
+        expect((await send("app_mention", "Ev-bot-forged", "wrong-signature")).status).toBe(401);
+        expect(await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id))).toEqual([]);
+        expect((await send("app_mention", "Ev-bot-mention")).ok).toBe(true);
+        expect((await send("app_mention", "Ev-bot-mention")).ok).toBe(true);
+        expect((await send("message", "Ev-bot-message")).ok).toBe(true);
+        const deliveries = await db.select().from(chatDeliveries).where(eq(chatDeliveries.endpointId, f.endpoint.id));
+        expect(deliveries).toHaveLength(1);
+        expect(deliveries[0]!.normalizedEvent).toMatchObject({ principal: { isBot: true } });
+        await db.update(chatDeliveries).set({ nextAttemptAt: new Date(0) }).where(eq(chatDeliveries.id, deliveries[0]!.id));
+        await f.service.processPendingDeliveries(1, deliveries[0]!.id);
+        expect(f.wakeup).toHaveBeenCalledTimes(1);
+        expect(await f.service.listConversations(f.endpoint.id)).toHaveLength(1);
+        // A message-only bot callback must work independently of app_mention;
+        // the earlier same-message retry cannot establish this behavior.
+        for (const [ts, subtype] of [["9941.1", undefined], ["9942.1", "bot_message"]] as const) {
+          expect((await send("message", `Ev-bot-only-${ts}`, "test-signing-secret", ts, subtype)).ok).toBe(true);
+          const [delivery] = await db.select().from(chatDeliveries).where(and(eq(chatDeliveries.endpointId, f.endpoint.id), like(chatDeliveries.providerEventId, `%:${ts}`)));
+          expect(delivery).toBeDefined();
+          expect(delivery.normalizedEvent).toMatchObject({ principal: { isBot: true, externalId: senderId }, message: { slackBotMentioned: true } });
+          await db.update(chatDeliveries).set({ nextAttemptAt: new Date(0) }).where(eq(chatDeliveries.id, delivery.id));
+          await f.service.processPendingDeliveries(1, delivery.id);
+        }
+        expect(f.wakeup).toHaveBeenCalledTimes(3);
+        expect(await f.service.listConversations(f.endpoint.id)).toHaveLength(3);
+      } finally { await pinned.shutdown(); }
+    });
   });
 
   it("ignores signed Slack callbacks from a different workspace before SDK dispatch", async () => {
